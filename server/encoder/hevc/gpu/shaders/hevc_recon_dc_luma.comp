@@ -1,0 +1,182 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// Luma DC reconstruction wavefront. One workgroup encodes one 8x8 intra CU on
+// the current anti-diagonal: gather reference samples from the reconstructed
+// plane (availability = neighbour block on an earlier diagonal, which for DC
+// exactly matches HEVC decode-order availability), DC-predict, forward
+// transform + quantise -> levels, then dequantise + inverse transform -> add
+// prediction -> write reconstruction. Bit-exact port of cpu_encoder's DC path.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer SrcY { int v[]; } srcY;
+layout(set = 0, binding = 1, std430) buffer RecY { int v[]; } recY;
+layout(set = 0, binding = 2, std430) writeonly buffer LevY { int v[]; } levY;
+layout(set = 0, binding = 3, std430) writeonly buffer CbfY { uint v[]; } cbfY;
+layout(push_constant) uniform PC { uint w; uint h; int qp; int bit_depth; uint diag; uint bx_start; } pc;
+
+const int M[64] = int[64](
+	64, 64, 64, 64, 64, 64, 64, 64,
+	89, 75, 50, 18, -18, -50, -75, -89,
+	83, 36, -36, -83, -83, -36, 36, 83,
+	75, -18, -89, -50, 50, 89, 18, -75,
+	64, -64, -64, 64, 64, -64, -64, 64,
+	50, -89, 18, 75, -75, -18, 89, -50,
+	36, -83, 83, -36, -36, 83, -83, 36,
+	18, -50, 75, -89, 89, -75, 50, -18);
+const int quant_scale[6] = int[6](26214, 23302, 20560, 18396, 16384, 14564);
+const int level_scale[6] = int[6](40, 45, 51, 57, 64, 72);
+
+shared int refTop[17];
+shared int refLeft[17];
+shared int spred[64];
+shared int s0[64];
+shared int s1[64];
+shared int scbf;
+
+int clip16(int v) { return v < -32768 ? -32768 : (v > 32767 ? 32767 : v); }
+int clippix(int v, int mx) { return v < 0 ? 0 : (v > mx ? mx : v); }
+
+void main()
+{
+	uint bx = pc.bx_start + gl_WorkGroupID.x;
+	uint by = pc.diag - bx;
+	uint W = pc.w, H = pc.h;
+	if (bx * 8u >= W || by * 8u >= H)
+		return;
+	uint t = gl_LocalInvocationID.x;
+	int x = int(t & 7u), y = int(t >> 3);
+	int px = int(bx) * 8, py = int(by) * 8;
+	const int N = 8, log2n = 3;
+	int max_pix = (1 << pc.bit_depth) - 1;
+
+	// ---- reference sample gathering + substitution (thread 0) ----
+	if (t == 0u)
+	{
+		int xTb = px, yTb = py;
+		int total = 4 * N + 1; // 33
+		int seq[33];
+		bool sav[33];
+		int idx = 0;
+		for (int yy = 2 * N - 1; yy >= 0; --yy)
+		{
+			int nx = xTb - 1, ny = yTb + yy;
+			bool a = nx >= 0 && ny >= 0 && nx < int(W) && ny < int(H) && (uint(nx / 8) + uint(ny / 8) < pc.diag);
+			sav[idx] = a;
+			seq[idx] = a ? recY.v[ny * int(W) + nx] : 0;
+			++idx;
+		}
+		{
+			int nx = xTb - 1, ny = yTb - 1;
+			bool a = nx >= 0 && ny >= 0 && nx < int(W) && ny < int(H) && (uint(nx / 8) + uint(ny / 8) < pc.diag);
+			sav[idx] = a;
+			seq[idx] = a ? recY.v[ny * int(W) + nx] : 0;
+			++idx;
+		}
+		for (int xx = 0; xx < 2 * N; ++xx)
+		{
+			int nx = xTb + xx, ny = yTb - 1;
+			bool a = nx >= 0 && ny >= 0 && nx < int(W) && ny < int(H) && (uint(nx / 8) + uint(ny / 8) < pc.diag);
+			sav[idx] = a;
+			seq[idx] = a ? recY.v[ny * int(W) + nx] : 0;
+			++idx;
+		}
+		bool any = false;
+		for (int i = 0; i < total; ++i)
+			any = any || sav[i];
+		if (!any)
+		{
+			int def = 1 << (pc.bit_depth - 1);
+			for (int i = 0; i < total; ++i)
+				seq[i] = def;
+		}
+		else
+		{
+			if (!sav[0])
+			{
+				int f = 0;
+				while (!sav[f])
+					++f;
+				for (int i = 0; i < f; ++i)
+					seq[i] = seq[f];
+			}
+			for (int i = 1; i < total; ++i)
+				if (!sav[i])
+					seq[i] = seq[i - 1];
+		}
+		refLeft[0] = refTop[0] = seq[2 * N];
+		for (int k = 1; k <= 2 * N; ++k)
+		{
+			refLeft[k] = seq[2 * N - k];
+			refTop[k] = seq[2 * N + k];
+		}
+		scbf = 0;
+	}
+	barrier();
+
+	// ---- DC prediction (with luma boundary smoothing) ----
+	int sum = 0;
+	for (int i = 0; i < N; ++i)
+		sum += refTop[1 + i] + refLeft[1 + i];
+	int dc = (sum + N) >> (log2n + 1);
+	int p = dc;
+	if (x == 0 && y == 0)
+		p = (refLeft[1] + 2 * dc + refTop[1] + 2) >> 2;
+	else if (y == 0)
+		p = (refTop[1 + x] + 3 * dc + 2) >> 2;
+	else if (x == 0)
+		p = (refLeft[1 + y] + 3 * dc + 2) >> 2;
+	spred[t] = p;
+
+	// ---- residual ----
+	s0[t] = srcY.v[(py + y) * int(W) + (px + x)] - p;
+	barrier();
+
+	// ---- forward DCT ----
+	int shift1 = log2n + pc.bit_depth - 9;
+	int add1 = shift1 > 0 ? (1 << (shift1 - 1)) : 0;
+	int acc = 0;
+	for (int n = 0; n < 8; ++n)
+		acc += M[x * 8 + n] * s0[uint(y) * 8u + uint(n)];
+	s1[t] = shift1 > 0 ? ((acc + add1) >> shift1) : acc;
+	barrier();
+	int shift2 = log2n + 6;
+	int acc2 = 0;
+	for (int k = 0; k < 8; ++k)
+		acc2 += M[y * 8 + k] * s1[uint(k) * 8u + uint(x)];
+	int coeff = (acc2 + (1 << (shift2 - 1))) >> shift2;
+
+	// ---- quant ----
+	int qbits = 14 + pc.qp / 6 + (15 - pc.bit_depth - log2n);
+	int lvl = (abs(coeff) * quant_scale[pc.qp % 6] + (171 << (qbits - 9))) >> qbits;
+	lvl = coeff < 0 ? -lvl : lvl;
+	levY.v[(int(by) * int(W / 8u) + int(bx)) * 64 + int(t)] = lvl;
+	if (lvl != 0)
+		scbf = 1;
+
+	// ---- dequant ----
+	barrier();
+	int bd_shift = pc.bit_depth + log2n - 5;
+	int64_t dv = int64_t(lvl) * 16 * int64_t(level_scale[pc.qp % 6]);
+	dv = (dv << (pc.qp / 6));
+	dv = (dv + int64_t(1 << (bd_shift - 1))) >> bd_shift;
+	s0[t] = clip16(int(dv));
+	barrier();
+
+	// ---- inverse DCT ----
+	int e = 0;
+	for (int k = 0; k < 8; ++k)
+		e += M[k * 8 + y] * s0[uint(k) * 8u + uint(x)];
+	s1[t] = clip16((e + 64) >> 7);
+	barrier();
+	int ishift2 = 20 - pc.bit_depth;
+	int r = 0;
+	for (int k = 0; k < 8; ++k)
+		r += M[k * 8 + x] * s1[uint(y) * 8u + uint(k)];
+	int resid = (r + (1 << (ishift2 - 1))) >> ishift2;
+
+	// ---- reconstruct ----
+	recY.v[(py + y) * int(W) + (px + x)] = clippix(spred[t] + resid, max_pix);
+	barrier();
+	if (t == 0u)
+		cbfY.v[uint(by) * (W / 8u) + bx] = scbf;
+}

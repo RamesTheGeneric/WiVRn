@@ -278,6 +278,8 @@ struct encoder
 	// Choose DC vs Planar for the luma block by SAD.
 	int choose_luma_mode(int x, int y)
 	{
+		if (cfg.force_luma_mode >= 0)
+			return cfg.force_luma_mode;
 		int refTop[65], refLeft[65];
 		get_refs(Y, x, y, 8, bd, refTop, refLeft);
 		int predDC[64];

@@ -55,6 +55,11 @@ struct hevc_config
 
 	uint32_t num_slices = 1; // independent slices per picture (>=1)
 
+	// Testing/bring-up: force every luma CU to this intra mode (0=Planar, 1=DC).
+	// -1 = normal SAD-based DC/Planar decision. Used to compare against the GPU
+	// wavefront which currently implements DC only.
+	int force_luma_mode = -1;
+
 	// Derived helpers.
 	int general_profile_idc() const { return bit_depth > 8 ? 2 : 1; } // Main10 : Main
 	uint32_t ctb_size() const { return 1u << ctb_log2_size; }

@@ -246,6 +246,69 @@ public:
 		return p;
 	}
 
+	// A single dispatch step of a wavefront: its group count and push constants.
+	struct step
+	{
+		uint32_t gx, gy, gz;
+		std::vector<uint8_t> push;
+	};
+
+	// Record a sequence of dispatches into one command buffer, inserting a
+	// compute-to-compute memory barrier between each so a later step sees the
+	// storage-buffer writes of earlier steps. Used for the diagonal wavefront.
+	void run_wavefront(pipeline & p, const std::vector<buffer *> & bindings, const std::vector<step> & steps)
+	{
+		std::vector<VkDescriptorBufferInfo> infos(bindings.size());
+		std::vector<VkWriteDescriptorSet> writes(bindings.size());
+		for (size_t i = 0; i < bindings.size(); ++i)
+		{
+			infos[i] = {bindings[i]->buf, 0, VK_WHOLE_SIZE};
+			writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+			writes[i].dstSet = p.dset;
+			writes[i].dstBinding = (uint32_t)i;
+			writes[i].descriptorCount = 1;
+			writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			writes[i].pBufferInfo = &infos[i];
+		}
+		vkUpdateDescriptorSets(dev, (uint32_t)writes.size(), writes.data(), 0, nullptr);
+
+		VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+		cbai.commandPool = pool;
+		cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+		cbai.commandBufferCount = 1;
+		VkCommandBuffer cmd;
+		vkcheck(vkAllocateCommandBuffers(dev, &cbai, &cmd), "allocCmd");
+		VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+		bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		vkBeginCommandBuffer(cmd, &bi);
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &p.dset, 0, nullptr);
+		VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+		mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+		for (size_t s = 0; s < steps.size(); ++s)
+		{
+			if (s > 0)
+				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     0, 1, &mb, 0, nullptr, 0, nullptr);
+			if (!steps[s].push.empty())
+				vkCmdPushConstants(cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)steps[s].push.size(), steps[s].push.data());
+			vkCmdDispatch(cmd, steps[s].gx, steps[s].gy, steps[s].gz);
+		}
+		vkEndCommandBuffer(cmd);
+
+		VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+		VkFence fence;
+		vkCreateFence(dev, &fci, nullptr, &fence);
+		VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+		si.commandBufferCount = 1;
+		si.pCommandBuffers = &cmd;
+		vkcheck(vkQueueSubmit(queue, 1, &si, fence), "queueSubmit");
+		vkcheck(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX), "waitFence");
+		vkDestroyFence(dev, fence, nullptr);
+		vkFreeCommandBuffers(dev, pool, 1, &cmd);
+	}
+
 	// Bind buffers and dispatch (gx,gy,gz workgroups). Blocks until complete.
 	void run(pipeline & p, const std::vector<buffer *> & bindings, uint32_t gx, uint32_t gy, uint32_t gz,
 	         const void * push = nullptr, int push_bytes = 0)
