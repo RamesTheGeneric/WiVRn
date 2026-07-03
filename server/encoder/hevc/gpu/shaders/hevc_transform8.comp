@@ -1,0 +1,87 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// Full 8x8 transform round trip, one workgroup per block: forward DCT + quant
+// -> levels, then dequant + inverse DCT -> reconstructed residual. Bit-exact
+// port of transform.cpp (fdct/quant/dequant/idct) for n=8. This is the block
+// transform math reused by the reconstruction pass.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Res { int r[]; } res;      // residual in
+layout(set = 0, binding = 1, std430) writeonly buffer Lev { int l[]; } lev;     // quant levels out
+layout(set = 0, binding = 2, std430) writeonly buffer Rec { int r[]; } rec;     // recon residual out
+layout(push_constant) uniform PC { uint num_blocks; int qp; int bit_depth; } pc;
+
+const int M[64] = int[64](
+	64, 64, 64, 64, 64, 64, 64, 64,
+	89, 75, 50, 18, -18, -50, -75, -89,
+	83, 36, -36, -83, -83, -36, 36, 83,
+	75, -18, -89, -50, 50, 89, 18, -75,
+	64, -64, -64, 64, 64, -64, -64, 64,
+	50, -89, 18, 75, -75, -18, 89, -50,
+	36, -83, 83, -36, -36, 83, -83, 36,
+	18, -50, 75, -89, 89, -75, 50, -18);
+const int quant_scale[6] = int[6](26214, 23302, 20560, 18396, 16384, 14564);
+const int level_scale[6] = int[6](40, 45, 51, 57, 64, 72);
+
+shared int sa[64]; // ping
+shared int sb[64]; // pong
+
+int clip16(int v) { return v < -32768 ? -32768 : (v > 32767 ? 32767 : v); }
+
+void main()
+{
+	uint blk = gl_WorkGroupID.x;
+	if (blk >= pc.num_blocks)
+		return;
+	uint t = gl_LocalInvocationID.x;
+	uint row = t >> 3, col = t & 7u;
+	int base = int(blk) * 64;
+	const int log2n = 3;
+
+	// ---- forward DCT ----
+	sa[t] = res.r[base + int(t)];
+	barrier();
+	int shift1 = log2n + pc.bit_depth - 9;
+	int add1 = shift1 > 0 ? (1 << (shift1 - 1)) : 0;
+	int acc = 0;
+	for (int n = 0; n < 8; ++n)
+		acc += M[int(col) * 8 + n] * sa[row * 8u + uint(n)];
+	sb[t] = shift1 > 0 ? ((acc + add1) >> shift1) : acc;
+	barrier();
+	int shift2 = log2n + 6;
+	int acc2 = 0;
+	for (int y = 0; y < 8; ++y)
+		acc2 += M[int(row) * 8 + y] * sb[uint(y) * 8u + col];
+	int coeff = (acc2 + (1 << (shift2 - 1))) >> shift2;
+
+	// ---- quant ----
+	int transform_shift = 15 - pc.bit_depth - log2n;
+	int qbits = 14 + pc.qp / 6 + transform_shift;
+	int qscale = quant_scale[pc.qp % 6];
+	int offset = 171 << (qbits - 9);
+	int lvl = (abs(coeff) * qscale + offset) >> qbits;
+	lvl = coeff < 0 ? -lvl : lvl;
+	lev.l[base + int(t)] = lvl;
+
+	// ---- dequant ----
+	barrier();
+	int bd_shift = pc.bit_depth + log2n - 5;
+	int64_t dv = int64_t(lvl) * 16 * int64_t(level_scale[pc.qp % 6]);
+	dv = dv << (pc.qp / 6);
+	dv = (dv + int64_t(1 << (bd_shift - 1))) >> bd_shift;
+	sa[t] = clip16(int(dv)); // dequantised coeff d[row][col]
+	barrier();
+
+	// ---- inverse DCT: vertical pass e[y][x] = sum_k M[k][y]*d[k][x], >>7 ----
+	int e = 0;
+	for (int k = 0; k < 8; ++k)
+		e += M[k * 8 + int(row)] * sa[uint(k) * 8u + col];
+	sb[t] = clip16((e + 64) >> 7);
+	barrier();
+	// horizontal pass r[y][x] = sum_k M[k][x]*g[y][k], >>(20-bd)
+	int ishift2 = 20 - pc.bit_depth;
+	int r = 0;
+	for (int k = 0; k < 8; ++k)
+		r += M[k * 8 + int(col)] * sb[row * 8u + uint(k)];
+	rec.r[base + int(t)] = (r + (1 << (ishift2 - 1))) >> ishift2;
+}

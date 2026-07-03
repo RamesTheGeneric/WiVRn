@@ -1,0 +1,12 @@
+#version 460
+// Trivial shader: out[i] = in[i] * 2 + bias. Validates the compute harness.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer In { int v[]; } inb;
+layout(set = 0, binding = 1, std430) writeonly buffer Out { int v[]; } outb;
+layout(push_constant) uniform PC { uint count; int bias; } pc;
+void main()
+{
+	uint i = gl_GlobalInvocationID.x;
+	if (i >= pc.count) return;
+	outb.v[i] = inb.v[i] * 2 + pc.bias;
+}

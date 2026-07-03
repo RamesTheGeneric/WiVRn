@@ -1,0 +1,55 @@
+#version 460
+// 8x8 intra prediction (DC + Planar), one workgroup per block. Bit-exact port
+// of the DC/Planar branches of predict() in cpu_encoder.cpp. Reference samples
+// are provided pre-gathered/filtered: refs[block] = 17 top (idx0=corner) ++
+// 17 left (idx0=corner), matching refTop[0..16]/refLeft[0..16].
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Refs { int v[]; } refs;   // num_blocks * 34
+layout(set = 0, binding = 1, std430) writeonly buffer Pred { int v[]; } pred;  // num_blocks * 64
+layout(push_constant) uniform PC { uint num_blocks; int mode; int cidx; int bit_depth; } pc;
+
+const int MODE_PLANAR = 0;
+const int MODE_DC = 1;
+
+void main()
+{
+	uint blk = gl_WorkGroupID.x;
+	if (blk >= pc.num_blocks)
+		return;
+	uint t = gl_LocalInvocationID.x;
+	int x = int(t & 7u), y = int(t >> 3);
+	int rbase = int(blk) * 34; // 17 top + 17 left
+	int obase = int(blk) * 64;
+	const int N = 8, log2n = 3;
+
+	// refTop[k] = refs[rbase + k], refLeft[k] = refs[rbase + 17 + k]  (k=0..16)
+	#define RT(k) refs.v[rbase + (k)]
+	#define RL(k) refs.v[rbase + 17 + (k)]
+
+	int p;
+	if (pc.mode == MODE_PLANAR)
+	{
+		int topRight = RT(N + 1);
+		int botLeft = RL(N + 1);
+		p = ((N - 1 - x) * RL(1 + y) + (x + 1) * topRight + (N - 1 - y) * RT(1 + x) + (y + 1) * botLeft + N) >> (log2n + 1);
+	}
+	else // DC
+	{
+		int sum = 0;
+		for (int i = 0; i < N; ++i)
+			sum += RT(1 + i) + RL(1 + i);
+		int dc = (sum + N) >> (log2n + 1);
+		p = dc;
+		if (pc.cidx == 0) // N=8 < 32: DC boundary smoothing
+		{
+			if (x == 0 && y == 0)
+				p = (RL(1) + 2 * dc + RT(1) + 2) >> 2;
+			else if (y == 0)
+				p = (RT(1 + x) + 3 * dc + 2) >> 2;
+			else if (x == 0)
+				p = (RL(1 + y) + 3 * dc + 2) >> 2;
+		}
+	}
+	pred.v[obase + y * 8 + x] = p;
+}

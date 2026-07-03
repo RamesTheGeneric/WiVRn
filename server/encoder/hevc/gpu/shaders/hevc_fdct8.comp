@@ -1,0 +1,65 @@
+#version 460
+// Forward 8x8 integer DCT-II + quantisation, one workgroup per transform block.
+// Bit-exact port of wivrn::hevc::xform::fdct + quant (transform.cpp) for n=8.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Res { int r[]; } res;   // num_blocks * 64
+layout(set = 0, binding = 1, std430) writeonly buffer Lev { int l[]; } lev;  // num_blocks * 64
+layout(push_constant) uniform PC { uint num_blocks; int qp; int bit_depth; } pc;
+
+// dct8[k][n], k = frequency, n = spatial position (row-major).
+const int M[64] = int[64](
+	64, 64, 64, 64, 64, 64, 64, 64,
+	89, 75, 50, 18, -18, -50, -75, -89,
+	83, 36, -36, -83, -83, -36, 36, 83,
+	75, -18, -89, -50, 50, 89, 18, -75,
+	64, -64, -64, 64, 64, -64, -64, 64,
+	50, -89, 18, 75, -75, -18, 89, -50,
+	36, -83, 83, -36, -36, 83, -83, 36,
+	18, -50, 75, -89, 89, -75, 50, -18);
+
+const int quant_scale[6] = int[6](26214, 23302, 20560, 18396, 16384, 14564);
+
+shared int sres[64]; // input residual
+shared int stmp[64]; // after horizontal pass
+
+void main()
+{
+	uint blk = gl_WorkGroupID.x;
+	if (blk >= pc.num_blocks)
+		return;
+	uint t = gl_LocalInvocationID.x; // 0..63
+	uint row = t >> 3;
+	uint col = t & 7u;
+	int base = int(blk) * 64;
+
+	const int log2n = 3;
+	sres[t] = res.r[base + int(t)];
+	barrier();
+
+	// Horizontal pass: a[row][k=col] = sum_n M[k][n]*res[row][n], >> shift1.
+	int shift1 = log2n + pc.bit_depth - 9;
+	int add1 = shift1 > 0 ? (1 << (shift1 - 1)) : 0;
+	int acc = 0;
+	for (int n = 0; n < 8; ++n)
+		acc += M[int(col) * 8 + n] * sres[row * 8u + uint(n)];
+	stmp[t] = shift1 > 0 ? ((acc + add1) >> shift1) : acc;
+	barrier();
+
+	// Vertical pass: b[k2=row][k=col] = sum_y M[k2][y]*stmp[y][k], >> shift2.
+	int shift2 = log2n + 6;
+	int add2 = 1 << (shift2 - 1);
+	int acc2 = 0;
+	for (int y = 0; y < 8; ++y)
+		acc2 += M[int(row) * 8 + y] * stmp[uint(y) * 8u + col];
+	int coeff = (acc2 + add2) >> shift2;
+
+	// Quantisation (encoder dead-zone rounding).
+	int transform_shift = 15 - pc.bit_depth - log2n;
+	int qbits = 14 + pc.qp / 6 + transform_shift;
+	int scale = quant_scale[pc.qp % 6];
+	int offset = 171 << (qbits - 9); // == (171<<qbits)/512, int32-safe
+	int a = abs(coeff) * scale;
+	int lvl = (a + offset) >> qbits;
+	lev.l[base + int(t)] = coeff < 0 ? -lvl : lvl;
+}
