@@ -43,6 +43,10 @@ namespace wivrn
 class video_encoder_h2_67 : public video_encoder
 {
 	wivrn::vk_bundle & vk;
+	// Queue the encoder submits its compute work on: a dedicated compute-family
+	// queue if available (so the two eyes overlap and the compositor isn't
+	// blocked), else the shared main queue. Points at that queue's mutex.
+	std::mutex * enc_queue_mutex = nullptr;
 	vk::raii::CommandPool cmd_pool;
 
 	struct in_t

@@ -302,6 +302,16 @@ wivrn::vk_bundle::vk_bundle() :
 		U_LOG_D("queue index: %d", queue_index);
 		int transfer_queue_index = get_queue_index(queues, queues_info, transfer_queue.family_index);
 		U_LOG_D("transfer queue index: %d", transfer_queue_index);
+
+		// Extra dedicated compute queues for the shader-based encoder (up to 2).
+		std::vector<int> compute_queue_indices;
+		for (int i = 0; i < 2; ++i)
+		{
+			int idx = get_queue_index(queues, queues_info, queue.family_index);
+			if (idx < 0)
+				break;
+			compute_queue_indices.push_back(idx);
+		}
 #if WIVRN_USE_VULKAN_ENCODE
 		std::vector<int> encode_queue_indices;
 		for (int i = 0; i < debug_get_num_option_max_vulkan_encoders(); ++i)
@@ -370,6 +380,14 @@ wivrn::vk_bundle::vk_bundle() :
 			transfer_queue.queue = device.getQueue(transfer_queue.family_index, transfer_queue_index);
 			name(transfer_queue.queue, "transfer queue");
 		}
+		for (auto idx: compute_queue_indices)
+		{
+			auto & cq = compute_queues.emplace_back();
+			cq.queue = device.getQueue(queue.family_index, idx);
+			cq.family_index = queue.family_index;
+			name(cq.queue, "encoder compute queue");
+		}
+		U_LOG_I("Using %d dedicated encoder compute queue(s)", int(compute_queues.size()));
 #if WIVRN_USE_VULKAN_ENCODE
 		for (auto encode_queue_index: encode_queue_indices)
 		{

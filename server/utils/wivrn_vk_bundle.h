@@ -81,6 +81,10 @@ struct vk_bundle
 	queue_data queue;
 	queue_data transfer_queue;
 	beman::inplace_vector::inplace_vector<queue_data, 3> encode_queues;
+	// Extra dedicated compute-family queue instances so the shader-based encoder's
+	// per-eye work can run concurrently and off the compositor's queue. May be
+	// empty if the compute family exposes only one queue.
+	beman::inplace_vector::inplace_vector<queue_data, 2> compute_queues;
 
 	vk::raii::DebugUtilsMessengerEXT debug;
 

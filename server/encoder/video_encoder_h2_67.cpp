@@ -84,7 +84,11 @@ video_encoder_h2_67::video_encoder_h2_67(
 
 	const auto vphys = static_cast<VkPhysicalDevice>(*vk.physical_device);
 	const auto vdev = static_cast<VkDevice>(*vk.device);
-	const auto vqueue = static_cast<VkQueue>(*vk.queue.queue);
+	// A dedicated compute queue per eye if available, else the shared main queue.
+	auto & enc_q = (stream_idx < vk.compute_queues.size()) ? vk.compute_queues[stream_idx] : vk.queue;
+	enc_queue_mutex = &enc_q.mutex;
+	const auto vqueue = static_cast<VkQueue>(*enc_q.queue);
+	const uint32_t vqfam = enc_q.family_index;
 
 	if (use_h264)
 	{
@@ -96,7 +100,7 @@ video_encoder_h2_67::video_encoder_h2_67(
 		const auto & e = ::shaders.at("h264_cavlc_emit");
 		const auto & p = ::shaders.at("h264_cavlc_prefix");
 		const auto & s = ::shaders.at("h264_cavlc_stitch");
-		h264_enc.init_adopt(vphys, vdev, vqueue, vk.queue.family_index,
+		h264_enc.init_adopt(vphys, vdev, vqueue, vqfam,
 		                    r.data(), r.size(), e.data(), e.size(), p.data(), p.size(), s.data(), s.size());
 	}
 	else
@@ -112,7 +116,7 @@ video_encoder_h2_67::video_encoder_h2_67(
 		const auto & luma_spv = ::shaders.at("hevc_recon_dc_luma");
 		const auto & chroma_spv = ::shaders.at("hevc_recon_dc_chroma");
 		const auto & cabac_spv = ::shaders.at("hevc_cabac");
-		recon.init_adopt(vphys, vdev, vqueue, vk.queue.family_index,
+		recon.init_adopt(vphys, vdev, vqueue, vqfam,
 		                 luma_spv.data(), luma_spv.size(),
 		                 chroma_spv.data(), chroma_spv.size());
 		recon.init_cabac_adopt(cabac_spv.data(), cabac_spv.size());
@@ -223,7 +227,7 @@ std::optional<video_encoder::data> video_encoder_h2_67::encode(uint8_t slot, uin
 	{
 		std::shared_ptr<std::vector<uint8_t>> frame;
 		{
-			std::unique_lock lock(vk.queue.mutex);
+			std::unique_lock lock(*enc_queue_mutex);
 			frame = std::make_shared<std::vector<uint8_t>>(
 			        h264_enc.encode_frame(h264_cfg, extent.width, extent.height, luma, chroma));
 		}
@@ -249,7 +253,7 @@ std::optional<video_encoder::data> video_encoder_h2_67::encode(uint8_t slot, uin
 	// Full GPU path: reconstruction + CABAC entirely on the GPU (the level buffers
 	// never leave the device); only the compressed per-slice payloads come back.
 	{
-		std::unique_lock lock(vk.queue.mutex);
+		std::unique_lock lock(*enc_queue_mutex);
 		recon.encode_frame(cfg, extent.width, extent.height, luma, chroma,
 		                   slice_ctb_rows, slice_payloads);
 	}
