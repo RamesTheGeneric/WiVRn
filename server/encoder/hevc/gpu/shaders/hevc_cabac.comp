@@ -1,0 +1,486 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// GPU CABAC: one workgroup encodes one independent slice's entropy stream.
+// CABAC is strictly serial within a slice, so only thread 0 works; parallelism
+// comes from running many slices (workgroups) at once. This is a faithful port
+// of the CPU slice_coder (cabac_pass.cpp) + cabac_encoder (cabac_reference.cpp)
+// + residual_coding.cpp, and must stay byte-exact with them.
+//
+// The current encoder is all-IDR, all-DC, 8x8 CUs, filters off, so the coding
+// tree is always fully split to 8x8 and the intra-mode syntax is constant per CU
+// (mpm_idx is always 1 for DC). Those regularities are baked in here; revisit
+// when non-DC modes or larger TUs are added.
+layout(local_size_x = 1) in;
+
+// block_syntax (per 8x8 luma block b = by*bw + bx), matching cabac_pass:
+layout(set = 0, binding = 0, std430) readonly buffer CbfL { uint v[]; } cbfL;   // [nb]
+layout(set = 0, binding = 1, std430) readonly buffer CbfCb { uint v[]; } cbfCb; // [nb]
+layout(set = 0, binding = 2, std430) readonly buffer CbfCr { uint v[]; } cbfCr; // [nb]
+layout(set = 0, binding = 3, std430) readonly buffer LevY { int v[]; } levY;    // [nb*64]
+layout(set = 0, binding = 4, std430) readonly buffer LevCb { int v[]; } levCb;  // [nb*16]
+layout(set = 0, binding = 5, std430) readonly buffer LevCr { int v[]; } levCr;  // [nb*16]
+// Per-slice output: byte stream (one byte per uint) + byte count.
+layout(set = 0, binding = 6, std430) writeonly buffer Out { uint v[]; } outb;   // [nslices*stride]
+layout(set = 0, binding = 7, std430) buffer OutLen { uint v[]; } outlen;        // [nslices]
+// Scratch: 8x8-block availability grid, one region per slice.
+layout(set = 0, binding = 8, std430) buffer Avail { uint v[]; } availb;         // [nslices*nb]
+
+layout(push_constant) uniform PC {
+	int qp;
+	uint bw, bh;      // 8x8 blocks across / down (whole frame)
+	uint ctbs_x;      // CTBs across (whole frame)
+	uint ctb_row0;    // first CTB row of this slice
+	uint ctb_rows;    // CTB rows in this slice
+	uint out_stride;  // uints reserved per slice in outb
+	uint last_slice;  // 1 if this slice ends the picture (final terminate = 1)
+} pc;
+
+#include "cabac_tables.glsl.inc"
+
+// ---- per-invocation CABAC state ----
+int pstate[HEVC_CONTEXTS];
+int valmps[HEVC_CONTEXTS];
+int rrange, low, bits_outstanding;
+bool first_bit;
+uint out_base;   // uint offset of this slice's output region
+uint outpos;     // bytes written so far
+int cur, nbits;  // bit accumulator
+uint sliceb;     // this slice's block-scratch base (slice_idx * nb)
+uint bw, bh, W, H;
+
+int clip3(int lo, int hi, int v) { return v < lo ? lo : (v > hi ? hi : v); }
+
+void cb_init(int slice_qp_y)
+{
+	int qp = clip3(0, 51, slice_qp_y);
+	for (int i = 0; i < HEVC_CONTEXTS; ++i)
+	{
+		int iv = init_values0[i];
+		int m = (iv >> 4) * 5 - 45;
+		int n = ((iv & 15) << 3) - 16;
+		int pre = clip3(1, 126, ((m * qp) >> 4) + n);
+		if (pre <= 63) { pstate[i] = 63 - pre; valmps[i] = 0; }
+		else           { pstate[i] = pre - 64; valmps[i] = 1; }
+	}
+	rrange = 510; low = 0; bits_outstanding = 0; first_bit = true;
+	outpos = 0u; cur = 0; nbits = 0;
+}
+
+void put_bit_raw(int b)
+{
+	cur = (cur << 1) | (b & 1);
+	if (++nbits == 8)
+	{
+		outb.v[out_base + outpos] = uint(cur & 0xff);
+		++outpos;
+		cur = 0; nbits = 0;
+	}
+}
+
+void put_bit(int b)
+{
+	if (first_bit) first_bit = false;
+	else put_bit_raw(b);
+	while (bits_outstanding > 0) { put_bit_raw(1 - b); --bits_outstanding; }
+}
+
+void renorm()
+{
+	while (rrange < 256)
+	{
+		if (low < 256) { put_bit(0); }
+		else if (low >= 512) { low -= 512; put_bit(1); }
+		else { low -= 256; ++bits_outstanding; }
+		rrange <<= 1; low <<= 1;
+	}
+}
+
+void encode_bin(int ctx, int bin)
+{
+	int q = (rrange >> 6) & 3;
+	int lps = rangeTabLps[pstate[ctx] * 4 + q];
+	rrange -= lps;
+	if (bin != valmps[ctx])
+	{
+		low += rrange;
+		rrange = lps;
+		if (pstate[ctx] == 0) valmps[ctx] = 1 - valmps[ctx];
+		pstate[ctx] = transIdxLps[pstate[ctx]];
+	}
+	else
+	{
+		pstate[ctx] = transIdxMps[pstate[ctx]];
+	}
+	renorm();
+}
+
+void encode_bypass(int bin)
+{
+	low <<= 1;
+	if (bin != 0) low += rrange;
+	if (low >= 1024) { put_bit(1); low -= 1024; }
+	else if (low < 512) { put_bit(0); }
+	else { low -= 512; ++bits_outstanding; }
+}
+
+void encode_bypass_bits(uint value, int n)
+{
+	for (int i = n - 1; i >= 0; --i) encode_bypass(int((value >> uint(i)) & 1u));
+}
+
+void encode_terminate(int bin)
+{
+	rrange -= 2;
+	if (bin != 0)
+	{
+		low += rrange;
+		rrange = 2;
+		renorm();
+		put_bit((low >> 9) & 1);
+		put_bit_raw((low >> 8) & 1);
+		put_bit_raw(1);
+	}
+	else
+	{
+		renorm();
+	}
+}
+
+void cb_finish()
+{
+	while (nbits != 0) put_bit_raw(0);
+}
+
+// ---- availability grid (8x8 blocks) ----
+bool avail_ok(int x, int y)
+{
+	if (x < 0 || y < 0 || x >= int(W) || y >= int(H)) return false;
+	return availb.v[sliceb + uint((y >> 3) * int(bw) + (x >> 3))] != 0u;
+}
+
+// ---- residual_coding (port of residual_coding.cpp) ----
+void write_coeff_remain(int value, int rice)
+{
+	const int REDUCTION = 3;
+	if (value < (REDUCTION << rice))
+	{
+		int prefix = value >> rice;
+		for (int i = 0; i < prefix; ++i) encode_bypass(1);
+		encode_bypass(0);
+		if (rice > 0) encode_bypass_bits(uint(value & ((1 << rice) - 1)), rice);
+	}
+	else
+	{
+		int rem = value - (REDUCTION << rice);
+		int len = rice;
+		while (rem >= (1 << len)) { rem -= (1 << len); ++len; }
+		int prefix_ones = REDUCTION + (len - rice);
+		for (int i = 0; i < prefix_ones; ++i) encode_bypass(1);
+		encode_bypass(0);
+		encode_bypass_bits(uint(rem), len);
+	}
+}
+
+int sig_ctx_inc(int xc, int yc, int log2size, int cidx, int prev_csbf, int xs, int ys)
+{
+	int sig_ctx;
+	if (log2size == 2)
+	{
+		sig_ctx = ctx_idx_map[(yc << 2) + xc];
+	}
+	else if (xc + yc == 0)
+	{
+		sig_ctx = 0;
+	}
+	else
+	{
+		int xp = xc & 3, yp = yc & 3;
+		if (prev_csbf == 0)      sig_ctx = (xp + yp == 0) ? 2 : ((xp + yp < 3) ? 1 : 0);
+		else if (prev_csbf == 1) sig_ctx = (yp == 0) ? 2 : ((yp == 1) ? 1 : 0);
+		else if (prev_csbf == 2) sig_ctx = (xp == 0) ? 2 : ((xp == 1) ? 1 : 0);
+		else                     sig_ctx = 2;
+		if (cidx == 0)
+		{
+			if (xs + ys > 0) sig_ctx += 3;
+			sig_ctx += (log2size == 3) ? 9 : 21;
+		}
+		else
+		{
+			sig_ctx += (log2size == 3) ? 9 : 12;
+		}
+	}
+	return (cidx == 0) ? sig_ctx : 27 + sig_ctx;
+}
+
+// level buffer accessor: base is the block's coefficient base index.
+int lev(int cidx, uint base, int idx)
+{
+	if (cidx == 0) return levY.v[base + uint(idx)];
+	if (cidx == 1) return levCb.v[base + uint(idx)];
+	return levCr.v[base + uint(idx)];
+}
+
+void code_last_prefix(int val, int base_ctx, int log2size, int cidx)
+{
+	int gidx = group_idx[val];
+	int ctx_offset, ctx_shift;
+	if (cidx == 0)
+	{
+		ctx_offset = 3 * (log2size - 2) + ((log2size - 1) >> 2);
+		ctx_shift = (log2size + 1) >> 2;
+	}
+	else
+	{
+		ctx_offset = 15;
+		ctx_shift = log2size - 2;
+	}
+	int cmax = (log2size << 1) - 1;
+	for (int b = 0; b < gidx; ++b)
+		encode_bin(base_ctx + (b >> ctx_shift) + ctx_offset, 1);
+	if (gidx < cmax)
+		encode_bin(base_ctx + (gidx >> ctx_shift) + ctx_offset, 0);
+}
+
+void code_last_suffix(int val)
+{
+	int gidx = group_idx[val];
+	if (gidx >= 4)
+	{
+		int nb2 = (gidx >> 1) - 1;
+		encode_bypass_bits(uint(val - min_in_group[gidx]), nb2);
+	}
+}
+
+void residual_coding(int cidx, uint lbase, int log2size)
+{
+	int n = 1 << log2size;
+	int nsb = n >> 2;
+	int ctx_cidx = (cidx == 0) ? 0 : 1;
+	int num_sb = nsb * nsb;
+
+	// Locate last significant coeff in scan order.
+	int last_sb = 0, last_pos_in_sb = 0, last_x = 0, last_y = 0;
+	for (int sb = 0; sb < num_sb; ++sb)
+	{
+		int xs = (nsb == 1) ? 0 : scan_sb2_x[sb];
+		int ys = (nsb == 1) ? 0 : scan_sb2_y[sb];
+		for (int p = 0; p < 16; ++p)
+		{
+			int cx = xs * 4 + scan16_x[p];
+			int cy = ys * 4 + scan16_y[p];
+			if (lev(cidx, lbase, cy * n + cx) != 0)
+			{
+				last_sb = sb; last_pos_in_sb = p; last_x = cx; last_y = cy;
+			}
+		}
+	}
+
+	code_last_prefix(last_x, CTX_LAST_SIGNIFICANT_COEFF_X_PREFIX, log2size, cidx);
+	code_last_prefix(last_y, CTX_LAST_SIGNIFICANT_COEFF_Y_PREFIX, log2size, cidx);
+	code_last_suffix(last_x);
+	code_last_suffix(last_y);
+
+	int csbf[4]; // flattened 2x2 (index ys*nsb + xs); nsb<=2
+	for (int i = 0; i < 4; ++i) csbf[i] = 0;
+	int c1 = 1;
+
+	for (int sb = last_sb; sb >= 0; --sb)
+	{
+		int xs = (nsb == 1) ? 0 : scan_sb2_x[sb];
+		int ys = (nsb == 1) ? 0 : scan_sb2_y[sb];
+		bool sb_last = (sb == last_sb);
+		bool sb_first = (sb == 0);
+		int infer_dc_sig = 0;
+
+		if (!sb_last && !sb_first)
+		{
+			int right = (xs + 1 < nsb) ? csbf[ys * nsb + (xs + 1)] : 0;
+			int below = (ys + 1 < nsb) ? csbf[(ys + 1) * nsb + xs] : 0;
+			int any = 0;
+			for (int p = 0; p < 16 && any == 0; ++p)
+				if (lev(cidx, lbase, (ys * 4 + scan16_y[p]) * n + (xs * 4 + scan16_x[p])) != 0)
+					any = 1;
+			encode_bin(CTX_SIGNIFICANT_COEFF_GROUP_FLAG + ctx_cidx * 2 + (((right | below) != 0) ? 1 : 0), any);
+			csbf[ys * nsb + xs] = any;
+			if (any == 0) continue;
+			infer_dc_sig = 1;
+		}
+		else
+		{
+			csbf[ys * nsb + xs] = 1;
+		}
+
+		int right = (xs + 1 < nsb) ? csbf[ys * nsb + (xs + 1)] : 0;
+		int below = (ys + 1 < nsb) ? csbf[(ys + 1) * nsb + xs] : 0;
+		int prev_csbf = right | (below << 1);
+
+		int sig[16];
+		for (int i = 0; i < 16; ++i) sig[i] = 0;
+		if (sb_last) sig[last_pos_in_sb] = 1;
+		int start = sb_last ? last_pos_in_sb - 1 : 15;
+		int coded_any_sig = 0;
+		for (int p = start; p >= 0; --p)
+		{
+			int cx = xs * 4 + scan16_x[p];
+			int cy = ys * 4 + scan16_y[p];
+			if (p == 0 && infer_dc_sig != 0 && coded_any_sig == 0)
+			{
+				sig[0] = 1;
+				break;
+			}
+			int s = (lev(cidx, lbase, cy * n + cx) != 0) ? 1 : 0;
+			encode_bin(CTX_SIGNIFICANT_COEFF_FLAG + sig_ctx_inc(cx, cy, log2size, cidx, prev_csbf, xs, ys), s);
+			sig[p] = s;
+			if (s != 0) coded_any_sig = 1;
+		}
+
+		int sig_scan[16];
+		int num_sig = 0;
+		for (int p = 15; p >= 0; --p)
+			if (sig[p] != 0) sig_scan[num_sig++] = p;
+		if (num_sig == 0) continue;
+
+		int ctx_set = (sb > 0 && cidx == 0) ? 2 : 0;
+		if (c1 == 0) ++ctx_set;
+		c1 = 1;
+
+		int num_gt1 = num_sig < 8 ? num_sig : 8;
+		int gt1[16];
+		for (int i = 0; i < 16; ++i) gt1[i] = 0;
+		int first_gt1 = -1;
+		for (int k = 0; k < num_gt1; ++k)
+		{
+			int p = sig_scan[k];
+			int cx = xs * 4 + scan16_x[p];
+			int cy = ys * 4 + scan16_y[p];
+			int b = (abs(lev(cidx, lbase, cy * n + cx)) > 1) ? 1 : 0;
+			encode_bin(CTX_COEFF_ABS_LEVEL_GREATER1_FLAG + ctx_cidx * 16 + ctx_set * 4 + c1, b);
+			gt1[k] = b;
+			if (b != 0) { if (first_gt1 < 0) first_gt1 = k; c1 = 0; }
+			else if (c1 < 3 && c1 > 0) ++c1;
+		}
+
+		int gt2 = 0;
+		if (first_gt1 >= 0)
+		{
+			int p = sig_scan[first_gt1];
+			int cx = xs * 4 + scan16_x[p];
+			int cy = ys * 4 + scan16_y[p];
+			gt2 = (abs(lev(cidx, lbase, cy * n + cx)) > 2) ? 1 : 0;
+			encode_bin(CTX_COEFF_ABS_LEVEL_GREATER2_FLAG + ctx_cidx * 4 + ctx_set, gt2);
+		}
+
+		for (int k = 0; k < num_sig; ++k)
+		{
+			int p = sig_scan[k];
+			int cx = xs * 4 + scan16_x[p];
+			int cy = ys * 4 + scan16_y[p];
+			encode_bypass(lev(cidx, lbase, cy * n + cx) < 0 ? 1 : 0);
+		}
+
+		int rice = 0;
+		for (int k = 0; k < num_sig; ++k)
+		{
+			int p = sig_scan[k];
+			int cx = xs * 4 + scan16_x[p];
+			int cy = ys * 4 + scan16_y[p];
+			int absv = abs(lev(cidx, lbase, cy * n + cx));
+
+			int base_level;
+			if (k >= 8) base_level = 1;
+			else if (gt1[k] == 0) base_level = -1;
+			else if (k == first_gt1) base_level = (gt2 != 0) ? 3 : -1;
+			else base_level = 2;
+
+			if (base_level >= 0 && absv >= base_level)
+			{
+				write_coeff_remain(absv - base_level, rice);
+				if (absv > (3 << rice)) rice = rice < 4 ? rice + 1 : 4;
+			}
+		}
+	}
+}
+
+// ---- CU / quadtree ----
+void process_cu(int x0, int y0)
+{
+	int b = (y0 >> 3) * int(bw) + (x0 >> 3);
+	int cbf_luma = int(cbfL.v[b]);
+	int cbf_cb = int(cbfCb.v[b]);
+	int cbf_cr = int(cbfCr.v[b]);
+
+	encode_bin(CTX_PART_MODE + 0, 1); // 2Nx2N
+
+	// All-DC: mpm_idx is always 1, so the intra-mode syntax is constant.
+	encode_bin(CTX_PREV_INTRA_LUMA_PRED_FLAG, 1);
+	encode_bypass(1); // mpm_idx > 0
+	encode_bypass(0); // mpm_idx > 1  (mpm_idx == 1)
+
+	encode_bin(CTX_INTRA_CHROMA_PRED_MODE + 0, 0); // DM
+
+	encode_bin(CTX_CBF_CB_CR + 0, cbf_cb);
+	encode_bin(CTX_CBF_CB_CR + 0, cbf_cr);
+	encode_bin(CTX_CBF_LUMA + 1, cbf_luma);
+
+	if (cbf_luma != 0) residual_coding(0, uint(b) * 64u, 3);
+	if (cbf_cb != 0)   residual_coding(1, uint(b) * 16u, 2);
+	if (cbf_cr != 0)   residual_coding(2, uint(b) * 16u, 2);
+
+	availb.v[sliceb + uint(b)] = 1u;
+}
+
+void emit_split(int x0, int y0, int depth)
+{
+	// ct_depth of processed neighbours is always 3 (>depth), so the split
+	// context reduces to left/above availability.
+	int condL = avail_ok(x0 - 1, y0) ? 1 : 0;
+	int condA = avail_ok(x0, y0 - 1) ? 1 : 0;
+	encode_bin(CTX_SPLIT_CODING_UNIT_FLAG + condL + condA, 1);
+}
+
+void process_ctb(int cx, int cy)
+{
+	int bx0 = cx * 64, by0 = cy * 64;
+	emit_split(bx0, by0, 0);
+	for (int qy = 0; qy < 2; ++qy)
+	for (int qx = 0; qx < 2; ++qx)
+	{
+		int x1 = bx0 + qx * 32, y1 = by0 + qy * 32;
+		emit_split(x1, y1, 1);
+		for (int ry = 0; ry < 2; ++ry)
+		for (int rx = 0; rx < 2; ++rx)
+		{
+			int x2 = x1 + rx * 16, y2 = y1 + ry * 16;
+			emit_split(x2, y2, 2);
+			for (int sy = 0; sy < 2; ++sy)
+			for (int sx = 0; sx < 2; ++sx)
+				process_cu(x2 + sx * 8, y2 + sy * 8);
+		}
+	}
+}
+
+void main()
+{
+	uint slice = gl_WorkGroupID.x;
+	bw = pc.bw; bh = pc.bh;
+	W = bw * 8u; H = bh * 8u;
+	out_base = slice * pc.out_stride;
+	sliceb = slice * (bw * bh);
+
+	// Clear this slice's availability scratch.
+	for (uint i = 0u; i < bw * bh; ++i) availb.v[sliceb + i] = 0u;
+
+	cb_init(pc.qp);
+
+	uint cy0 = pc.ctb_row0;
+	uint cy1 = pc.ctb_row0 + pc.ctb_rows;
+	for (uint cy = cy0; cy < cy1; ++cy)
+		for (uint cx = 0u; cx < pc.ctbs_x; ++cx)
+		{
+			process_ctb(int(cx), int(cy));
+			bool pic_end = (pc.last_slice != 0u) && (cy + 1u == cy1) && (cx + 1u == pc.ctbs_x);
+			encode_terminate(pic_end ? 1 : 0);
+		}
+	cb_finish();
+	outlen.v[slice] = outpos;
+}

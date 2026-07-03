@@ -164,21 +164,28 @@ struct slice_coder
 		}
 	}
 
+	// CABAC payload only (no header/NAL) for CTB rows [row0, row0+rows).
+	std::vector<uint8_t> code(int row0, int rows, bool last)
+	{
+		cb.init(0, cfg.qp);
+		const uint32_t nx = cfg.ctbs_x();
+		const uint32_t cy0 = row0, cy1 = row0 + rows;
+		for (uint32_t cy = cy0; cy < cy1; ++cy)
+			for (uint32_t cx = 0; cx < nx; ++cx)
+			{
+				quadtree(cx * 64, cy * 64, 6, 0);
+				const bool pic_end = last && (cy + 1 == cy1) && (cx + 1 == nx);
+				cb.encode_terminate(pic_end ? 1 : 0);
+			}
+		return cb.finish();
+	}
+
 	std::vector<uint8_t> run()
 	{
 		bitwriter hdr;
 		write_slice_header(hdr, cfg, 0, true);
 		auto rbsp = hdr.bytes();
-
-		cb.init(0, cfg.qp);
-		const uint32_t nx = cfg.ctbs_x(), ny = cfg.ctbs_y();
-		for (uint32_t cy = 0; cy < ny; ++cy)
-			for (uint32_t cx = 0; cx < nx; ++cx)
-			{
-				quadtree(cx * 64, cy * 64, 6, 0);
-				cb.encode_terminate((cy + 1 == ny && cx + 1 == nx) ? 1 : 0);
-			}
-		auto cbytes = cb.finish();
+		auto cbytes = code(0, (int)cfg.ctbs_y(), true);
 		rbsp.insert(rbsp.end(), cbytes.begin(), cbytes.end());
 
 		std::vector<uint8_t> nal;
@@ -193,6 +200,13 @@ std::vector<uint8_t> encode_slice_from_syntax(const hevc_config & cfg, const blo
 {
 	slice_coder sc(cfg, bs);
 	return sc.run();
+}
+
+std::vector<uint8_t> encode_slice_payload(const hevc_config & cfg, const block_syntax & bs,
+                                          int ctb_row0, int ctb_rows, bool last)
+{
+	slice_coder sc(cfg, bs);
+	return sc.code(ctb_row0, ctb_rows, last);
 }
 
 } // namespace wivrn::h267

@@ -47,4 +47,11 @@ struct block_syntax
 // residual_coding / CABAC engine. (Call build_parameter_sets() separately.)
 std::vector<uint8_t> encode_slice_from_syntax(const hevc_config & cfg, const block_syntax & bs);
 
+// Just the CABAC payload (cb.finish() bytes, no slice header, no NAL framing)
+// for the slice covering CTB rows [ctb_row0, ctb_row0+ctb_rows). last=true emits
+// the picture-final terminate. This is the byte-exact reference for the GPU CABAC
+// shader and the basis for multi-slice output.
+std::vector<uint8_t> encode_slice_payload(const hevc_config & cfg, const block_syntax & bs,
+                                          int ctb_row0, int ctb_rows, bool last);
+
 } // namespace wivrn::h267
