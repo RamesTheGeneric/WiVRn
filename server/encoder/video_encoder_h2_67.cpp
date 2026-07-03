@@ -104,8 +104,10 @@ video_encoder_h2_67::video_encoder_h2_67(
 	recon.init_cabac_adopt(cabac_spv.data(), cabac_spv.size());
 
 	// CTB rows per independent slice: fewer = better compression, more = more GPU
-	// CABAC parallelism. Configurable via the "slice-rows" encoder option.
-	slice_ctb_rows = 2;
+	// CABAC parallelism. 1 row/slice maximises parallelism (CABAC is serial within
+	// a slice, so slice count is the only parallelism). Configurable via the
+	// "slice-rows" encoder option.
+	slice_ctb_rows = 1;
 	if (auto it = settings.options.find("slice-rows"); it != settings.options.end())
 	{
 		try
