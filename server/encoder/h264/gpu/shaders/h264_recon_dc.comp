@@ -1,0 +1,288 @@
+#version 460
+// H.264 I_16x16 DC reconstruction, one workgroup per macroblock on an
+// anti-diagonal (MB (mbx,mby) depends only on the left and top MBs' recon, so a
+// diagonal sweep matches decode-order availability). Bit-exact port of
+// cpu_encoder264: DC intra prediction from reconstructed MB neighbours, 4x4
+// forward transform + quant, luma/chroma Hadamard DC, then inverse to recon,
+// emitting per-4x4-block levels + nnz for the CAVLC stage.
+layout(local_size_x = 32) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer SrcY { uint v[]; } srcY;   // packed u8 luma (ew*eh)
+layout(set = 0, binding = 1, std430) readonly buffer SrcC { uint v[]; } srcC;   // packed u8 interleaved CbCr
+layout(set = 0, binding = 2, std430) buffer RecY { int v[]; } recY;             // coded cw*ch
+layout(set = 0, binding = 3, std430) buffer RecCb { int v[]; } recCb;
+layout(set = 0, binding = 4, std430) buffer RecCr { int v[]; } recCr;
+layout(set = 0, binding = 5, std430) writeonly buffer OutLDC { int v[]; } outLDC;   // [nmb*16]
+layout(set = 0, binding = 6, std430) buffer OutLAC { int v[]; } outLAC;   // [nmb*16*16] (recon reads back)
+layout(set = 0, binding = 7, std430) writeonly buffer OutCDC { int v[]; } outCDC;   // [nmb*2*4]
+layout(set = 0, binding = 8, std430) buffer OutCAC { int v[]; } outCAC;   // [nmb*2*4*16] (recon reads back)
+layout(set = 0, binding = 9, std430) writeonly buffer OutNL { uint v[]; } outNL;    // [nmb*16]
+layout(set = 0, binding = 10, std430) writeonly buffer OutNC { uint v[]; } outNC;   // [nmb*2*4]
+
+layout(push_constant) uniform PC {
+	uint mbw, mbh;
+	int qp, qpc;
+	uint cw, ch;   // coded luma dims
+	uint ew, eh;   // extent (source) luma dims
+	uint diag, mbx_start;
+} pc;
+
+const int MF[6][3] = int[6][3](int[3](13107, 5243, 8066), int[3](11916, 4660, 7490), int[3](10082, 4194, 6554),
+                               int[3](9362, 3647, 5825), int[3](8192, 3355, 5243), int[3](7282, 2893, 4559));
+const int VS[6][3] = int[6][3](int[3](10, 16, 13), int[3](11, 18, 14), int[3](13, 20, 16),
+                               int[3](14, 23, 18), int[3](16, 25, 20), int[3](18, 29, 23));
+
+int clsOf(int i, int j) { return (i % 2 == 0 && j % 2 == 0) ? 0 : ((i % 2 == 1 && j % 2 == 1) ? 1 : 2); }
+int clippix(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
+
+int u8Y(int x, int y)
+{
+	x = min(x, int(pc.ew) - 1);
+	y = min(y, int(pc.eh) - 1);
+	uint bi = uint(y) * pc.ew + uint(x);
+	return int((srcY.v[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xffu);
+}
+int u8C(int x, int y, uint comp)
+{
+	int ewc = int(pc.ew) / 2, ehc = int(pc.eh) / 2;
+	x = min(x, ewc - 1);
+	y = min(y, ehc - 1);
+	uint bi = (uint(y) * uint(ewc) + uint(x)) * 2u + comp;
+	return int((srcC.v[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xffu);
+}
+
+// 4x4 forward core transform (raster in/out).
+void fdct4(inout int b[16])
+{
+	int t[16];
+	for (int i = 0; i < 4; ++i) {
+		int x0 = b[i*4+0], x1 = b[i*4+1], x2 = b[i*4+2], x3 = b[i*4+3];
+		int s0 = x0 + x3, s1 = x1 + x2, s2 = x1 - x2, s3 = x0 - x3;
+		t[i*4+0] = s0 + s1; t[i*4+1] = 2*s3 + s2; t[i*4+2] = s0 - s1; t[i*4+3] = s3 - 2*s2;
+	}
+	for (int j = 0; j < 4; ++j) {
+		int x0 = t[0*4+j], x1 = t[1*4+j], x2 = t[2*4+j], x3 = t[3*4+j];
+		int s0 = x0 + x3, s1 = x1 + x2, s2 = x1 - x2, s3 = x0 - x3;
+		b[0*4+j] = s0 + s1; b[1*4+j] = 2*s3 + s2; b[2*4+j] = s0 - s1; b[3*4+j] = s3 - 2*s2;
+	}
+}
+
+int quantAC(int coeff, int row, int col, int qp) {
+	int qbits = 15 + qp / 6;
+	int f = (1 << qbits) / 3;
+	int a = abs(coeff);
+	int lvl = (a * MF[qp % 6][clsOf(row, col)] + f) >> qbits;
+	return coeff < 0 ? -lvl : lvl;
+}
+int quantDC(int had, int qp) {
+	int qbits = 15 + qp / 6;
+	int f = (1 << qbits) / 3;
+	int a = abs(had);
+	int lvl = (a * MF[qp % 6][0] + 2 * f) >> (qbits + 1);
+	return had < 0 ? -lvl : lvl;
+}
+
+// inverse 4x4 (dequant + inverse core), DC from override.
+void idct4(inout int lv[16], int qp, int dcov, out int res[16]) {
+	int d[16];
+	for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) {
+		int idx = i*4+j;
+		if (idx == 0) { d[0] = dcov; continue; }
+		int ls = 16 * VS[qp % 6][clsOf(i, j)];
+		if (qp >= 24) d[idx] = (lv[idx] * ls) << (qp/6 - 4);
+		else d[idx] = (lv[idx] * ls + (1 << (3 - qp/6))) >> (4 - qp/6);
+	}
+	int f[16];
+	for (int i = 0; i < 4; ++i) {
+		int e0 = d[i*4+0] + d[i*4+2], e1 = d[i*4+0] - d[i*4+2], e2 = (d[i*4+1] >> 1) - d[i*4+3], e3 = d[i*4+1] + (d[i*4+3] >> 1);
+		f[i*4+0] = e0 + e3; f[i*4+1] = e1 + e2; f[i*4+2] = e1 - e2; f[i*4+3] = e0 - e3;
+	}
+	for (int j = 0; j < 4; ++j) {
+		int g0 = f[0*4+j] + f[2*4+j], g1 = f[0*4+j] - f[2*4+j], g2 = (f[1*4+j] >> 1) - f[3*4+j], g3 = f[1*4+j] + (f[3*4+j] >> 1);
+		res[0*4+j] = (g0 + g3 + 32) >> 6; res[1*4+j] = (g1 + g2 + 32) >> 6; res[2*4+j] = (g1 - g2 + 32) >> 6; res[3*4+j] = (g0 - g3 + 32) >> 6;
+	}
+}
+
+shared int predY;
+shared int predCb[4];
+shared int predCr[4];
+shared int dcRawL[16];
+shared int dcRawCb[4];
+shared int dcRawCr[4];
+shared int dcYL[16];
+shared int dcYCb[4];
+shared int dcYCr[4];
+shared uint mbx_s, mby_s;
+shared bool availL_s, availT_s;
+
+void main()
+{
+	uint t = gl_LocalInvocationID.x;
+	if (t == 0u) {
+		uint bx = pc.mbx_start + gl_WorkGroupID.x;
+		uint by = pc.diag - bx;
+		mbx_s = bx; mby_s = by;
+		availL_s = bx > 0u; availT_s = by > 0u;
+	}
+	barrier();
+	uint mbx = mbx_s, mby = mby_s;
+	if (mbx >= pc.mbw || mby >= pc.mbh) return;
+	int px = int(mbx) * 16, py = int(mby) * 16;
+	int cw = int(pc.cw), ch = int(pc.ch), cw2 = cw / 2, ch2 = ch / 2;
+	int cpx = int(mbx) * 8, cpy = int(mby) * 8;
+	bool availL = availL_s, availT = availT_s;
+	uint nmb_idx = mby * pc.mbw + mbx;
+
+	// ---- predictions (thread 0) ----
+	if (t == 0u) {
+		int sT = 0, sL = 0;
+		for (int i = 0; i < 16; ++i) {
+			if (availT) sT += recY.v[(py - 1) * cw + (px + i)];
+			if (availL) sL += recY.v[(py + i) * cw + (px - 1)];
+		}
+		if (availT && availL) predY = (sT + sL + 16) >> 5;
+		else if (availT) predY = (sT + 8) >> 4;
+		else if (availL) predY = (sL + 8) >> 4;
+		else predY = 128;
+		// chroma per sub-block
+		for (int comp = 0; comp < 2; ++comp) {
+			for (int sb = 0; sb < 4; ++sb) {
+				int sbx = (sb & 1) * 4, sby = (sb >> 1) * 4;
+				int cT = 0, cL = 0;
+				for (int i = 0; i < 4; ++i) {
+					if (availT) cT += (comp == 0 ? recCb.v[(cpy - 1) * cw2 + (cpx + sbx + i)] : recCr.v[(cpy - 1) * cw2 + (cpx + sbx + i)]);
+					if (availL) cL += (comp == 0 ? recCb.v[(cpy + sby + i) * cw2 + (cpx - 1)] : recCr.v[(cpy + sby + i) * cw2 + (cpx - 1)]);
+				}
+				int pcv;
+				bool diag = (sbx == 0 && sby == 0) || (sbx > 0 && sby > 0);
+				if (diag) {
+					if (availT && availL) pcv = (cT + cL + 4) >> 3;
+					else if (availT) pcv = (cT + 2) >> 2;
+					else if (availL) pcv = (cL + 2) >> 2;
+					else pcv = 128;
+				} else if (sbx > 0) {
+					if (availT) pcv = (cT + 2) >> 2; else if (availL) pcv = (cL + 2) >> 2; else pcv = 128;
+				} else {
+					if (availL) pcv = (cL + 2) >> 2; else if (availT) pcv = (cT + 2) >> 2; else pcv = 128;
+				}
+				if (comp == 0) predCb[sb] = pcv; else predCr[sb] = pcv;
+			}
+		}
+	}
+	barrier();
+
+	// ---- per-block forward transform + quant (threads 0..23) ----
+	if (t < 16u) {
+		int bx = int(t & 3u), by = int(t >> 2);
+		int blk[16];
+		for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c)
+			blk[r*4+c] = u8Y(px + bx*4 + c, py + by*4 + r) - predY;
+		fdct4(blk);
+		dcRawL[by*4+bx] = blk[0];
+		uint acbase = nmb_idx * 256u + uint(by*4+bx) * 16u;
+		outLAC.v[acbase + 0u] = 0;
+		uint nz = 0u;
+		for (int k = 1; k < 16; ++k) {
+			int lv = quantAC(blk[k], k/4, k%4, pc.qp);
+			outLAC.v[acbase + uint(k)] = lv;
+			if (lv != 0) ++nz;
+		}
+		outNL.v[nmb_idx * 16u + uint(by*4+bx)] = nz;
+	} else if (t < 24u) {
+		int comp = (t < 20u) ? 0 : 1;
+		int sb = int(t) - (comp == 0 ? 16 : 20);
+		int sbx = (sb & 1) * 4, sby = (sb >> 1) * 4;
+		int pcv = comp == 0 ? predCb[sb] : predCr[sb];
+		int blk[16];
+		for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c)
+			blk[r*4+c] = u8C(cpx + sbx + c, cpy + sby + r, uint(comp)) - pcv;
+		fdct4(blk);
+		if (comp == 0) dcRawCb[(sby/4)*2+(sbx/4)] = blk[0]; else dcRawCr[(sby/4)*2+(sbx/4)] = blk[0];
+		uint acbase = nmb_idx * 128u + uint(comp) * 64u + uint(sb) * 16u;
+		outCAC.v[acbase + 0u] = 0;
+		uint nz = 0u;
+		for (int k = 1; k < 16; ++k) {
+			int lv = quantAC(blk[k], k/4, k%4, pc.qpc);
+			outCAC.v[acbase + uint(k)] = lv;
+			if (lv != 0) ++nz;
+		}
+		outNC.v[nmb_idx * 8u + uint(comp) * 4u + uint(sb)] = nz;
+	}
+	barrier();
+
+	// ---- DC Hadamard + quant (thread 0) ----
+	if (t == 0u) {
+		// luma 4x4 Hadamard with (x+1)>>1 on pass 2
+		int tmp[16];
+		for (int i = 0; i < 4; ++i) {
+			int x0=dcRawL[i*4+0],x1=dcRawL[i*4+1],x2=dcRawL[i*4+2],x3=dcRawL[i*4+3];
+			int s0=x0+x3,s1=x1+x2,s2=x1-x2,s3=x0-x3;
+			tmp[i*4+0]=s0+s1; tmp[i*4+1]=s3+s2; tmp[i*4+2]=s0-s1; tmp[i*4+3]=s3-s2;
+		}
+		int had[16];
+		for (int j = 0; j < 4; ++j) {
+			int x0=tmp[0*4+j],x1=tmp[1*4+j],x2=tmp[2*4+j],x3=tmp[3*4+j];
+			int s0=x0+x3,s1=x1+x2,s2=x1-x2,s3=x0-x3;
+			had[0*4+j]=(s0+s1+1)>>1; had[1*4+j]=(s3+s2+1)>>1; had[2*4+j]=(s0-s1+1)>>1; had[3*4+j]=(s3-s2+1)>>1;
+		}
+		int lv[16];
+		for (int i = 0; i < 16; ++i) { lv[i] = quantDC(had[i], pc.qp); outLDC.v[nmb_idx*16u+uint(i)] = lv[i]; }
+		// inverse luma DC -> dcYL
+		int f[16];
+		for (int i=0;i<4;++i){int x0=lv[i*4+0],x1=lv[i*4+1],x2=lv[i*4+2],x3=lv[i*4+3];
+			f[i*4+0]=x0+x1+x2+x3; f[i*4+1]=x0+x1-x2-x3; f[i*4+2]=x0-x1-x2+x3; f[i*4+3]=x0-x1+x2-x3;}
+		int g[16];
+		for (int j=0;j<4;++j){int a=f[0*4+j],b=f[1*4+j],c=f[2*4+j],e=f[3*4+j];
+			g[0*4+j]=a+b+c+e; g[1*4+j]=a+b-c-e; g[2*4+j]=a-b-c+e; g[3*4+j]=a-b+c-e;}
+		int ls = 16 * VS[pc.qp % 6][0];
+		for (int i=0;i<16;++i){
+			if (pc.qp >= 36) dcYL[i] = (g[i]*ls) << (pc.qp/6 - 6);
+			else dcYL[i] = (g[i]*ls + (1 << (5 - pc.qp/6))) >> (6 - pc.qp/6);
+		}
+		// chroma 2x2 Hadamard per component
+		for (int comp = 0; comp < 2; ++comp) {
+			int c0,c1,c2,c3;
+			if (comp==0){c0=dcRawCb[0];c1=dcRawCb[1];c2=dcRawCb[2];c3=dcRawCb[3];}
+			else {c0=dcRawCr[0];c1=dcRawCr[1];c2=dcRawCr[2];c3=dcRawCr[3];}
+			int h0=c0+c1+c2+c3, h1=c0-c1+c2-c3, h2=c0+c1-c2-c3, h3=c0-c1-c2+c3;
+			int L0=quantDC(h0,pc.qpc),L1=quantDC(h1,pc.qpc),L2=quantDC(h2,pc.qpc),L3=quantDC(h3,pc.qpc);
+			uint cbase = nmb_idx*8u + uint(comp)*4u;
+			outCDC.v[cbase+0u]=L0; outCDC.v[cbase+1u]=L1; outCDC.v[cbase+2u]=L2; outCDC.v[cbase+3u]=L3;
+			// inverse 2x2 Hadamard + scale
+			int fa=L0+L1+L2+L3, fb=L0-L1+L2-L3, fc=L0+L1-L2-L3, fd=L0-L1-L2+L3;
+			int lsc = 16 * VS[pc.qpc % 6][0];
+			int d0=((fa*lsc)<<(pc.qpc/6))>>5, d1=((fb*lsc)<<(pc.qpc/6))>>5, d2=((fc*lsc)<<(pc.qpc/6))>>5, d3=((fd*lsc)<<(pc.qpc/6))>>5;
+			if (comp==0){dcYCb[0]=d0;dcYCb[1]=d1;dcYCb[2]=d2;dcYCb[3]=d3;}
+			else {dcYCr[0]=d0;dcYCr[1]=d1;dcYCr[2]=d2;dcYCr[3]=d3;}
+		}
+	}
+	barrier();
+
+	// ---- reconstruction ----
+	if (t < 16u) {
+		int bx = int(t & 3u), by = int(t >> 2);
+		int lv[16]; lv[0]=0;
+		uint acbase = nmb_idx * 256u + uint(by*4+bx) * 16u;
+		for (int k = 1; k < 16; ++k) lv[k] = outLAC.v[acbase + uint(k)];
+		int res[16];
+		idct4(lv, pc.qp, dcYL[by*4+bx], res);
+		for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c)
+			recY.v[(py + by*4 + r) * cw + (px + bx*4 + c)] = clippix(predY + res[r*4+c]);
+	} else if (t < 24u) {
+		int comp = (t < 20u) ? 0 : 1;
+		int sb = int(t) - (comp == 0 ? 16 : 20);
+		int sbx = (sb & 1) * 4, sby = (sb >> 1) * 4;
+		int pcv = comp == 0 ? predCb[sb] : predCr[sb];
+		int dcov = comp == 0 ? dcYCb[(sby/4)*2+(sbx/4)] : dcYCr[(sby/4)*2+(sbx/4)];
+		int lv[16]; lv[0]=0;
+		uint acbase = nmb_idx * 128u + uint(comp) * 64u + uint(sb) * 16u;
+		for (int k = 1; k < 16; ++k) lv[k] = outCAC.v[acbase + uint(k)];
+		int res[16];
+		idct4(lv, pc.qpc, dcov, res);
+		for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) {
+			int val = clippix(pcv + res[r*4+c]);
+			if (comp == 0) recCb.v[(cpy + sby + r) * cw2 + (cpx + sbx + c)] = val;
+			else recCr.v[(cpy + sby + r) * cw2 + (cpx + sbx + c)] = val;
+		}
+	}
+}
