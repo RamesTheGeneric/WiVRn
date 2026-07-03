@@ -55,13 +55,13 @@ class video_encoder_h2_67 : public video_encoder
 	uint32_t luma_stride;
 	uint32_t chroma_stride;
 
-	hevc::hevc_config cfg;
+	h267::hevc_config cfg;
 	std::vector<uint8_t> parameter_sets;
 
-	hevc::gpu::reconstructor recon;
+	h267::gpu::reconstructor recon;
 	// Reused host-side coded-size source planes and syntax across frames.
 	std::vector<int32_t> src_y, src_cb, src_cr;
-	hevc::block_syntax bs;
+	h267::block_syntax bs;
 
 public:
 	video_encoder_h2_67(wivrn::vk_bundle & vk, const encoder_settings & settings, uint8_t stream_idx);

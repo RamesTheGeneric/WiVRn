@@ -1,6 +1,6 @@
 #version 460
 // Forward 8x8 integer DCT-II + quantisation, one workgroup per transform block.
-// Bit-exact port of wivrn::hevc::xform::fdct + quant (transform.cpp) for n=8.
+// Bit-exact port of wivrn::h267::xform::fdct + quant (transform.cpp) for n=8.
 layout(local_size_x = 64) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer Res { int r[]; } res;   // num_blocks * 64

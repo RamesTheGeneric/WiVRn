@@ -17,8 +17,8 @@
 #include <cstdlib>
 #include <unistd.h>
 
-using namespace wivrn::hevc;
-using namespace wivrn::hevc::tables;
+using namespace wivrn::h267;
+using namespace wivrn::h267::tables;
 
 // Encode one 64x64 CTB coded as a single 2Nx2N intra CU with no residual.
 static void encode_flat_ctb(cabac_encoder & cb)

@@ -8,8 +8,8 @@
 #include <cstring>
 #include <vector>
 #include <cmath>
-using namespace wivrn::hevc;
-using namespace wivrn::hevc::gpu;
+using namespace wivrn::h267;
+using namespace wivrn::h267::gpu;
 static int chroma_qp(int q){ if(q<30)return q; if(q>43)return q-6; static const int t[14]={29,30,31,32,33,33,34,34,35,35,36,36,37,37}; return t[q-30]; }
 struct PC{uint32_t w,h;int qp,bd;uint32_t diag,bx_start;};
 static std::vector<vk_compute::step> wf(int W,int H,int qp,int bw,int bh){

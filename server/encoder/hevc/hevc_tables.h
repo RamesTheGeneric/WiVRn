@@ -24,7 +24,7 @@
 // transforms of clause 8.6. The context initialisation values and their layout
 // match the reference decoders (FFmpeg / libde265); any deviation here would
 // desynchronise a conforming decoder, so these must stay byte-exact.
-namespace wivrn::hevc::tables
+namespace wivrn::h267::tables
 {
 
 // "Context Not Used" default initialisation value.
@@ -346,4 +346,4 @@ inline constexpr uint8_t transIdxMps[64] = {
         49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 62, 63,
 };
 
-} // namespace wivrn::hevc::tables
+} // namespace wivrn::h267::tables

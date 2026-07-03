@@ -13,7 +13,7 @@
 #include <cstdlib>
 #include <vector>
 
-using namespace wivrn::hevc::gpu;
+using namespace wivrn::h267::gpu;
 
 int main(int argc, char ** argv)
 {
@@ -49,8 +49,8 @@ int main(int argc, char ** argv)
 		for (uint32_t b = 0; b < nblocks; ++b)
 		{
 			int32_t coeff[64], cpu[64];
-			wivrn::hevc::xform::fdct(rp + b * 64, coeff, 8, bd);
-			wivrn::hevc::xform::quant(coeff, cpu, 8, qp, bd);
+			wivrn::h267::xform::fdct(rp + b * 64, coeff, 8, bd);
+			wivrn::h267::xform::quant(coeff, cpu, 8, qp, bd);
 			for (int i = 0; i < 64; ++i)
 				if (cpu[i] != gpu[b * 64 + i])
 				{

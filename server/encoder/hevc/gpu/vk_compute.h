@@ -32,7 +32,7 @@
 #include <vector>
 #include <vulkan/vulkan.h>
 
-namespace wivrn::hevc::gpu
+namespace wivrn::h267::gpu
 {
 
 inline void vkcheck(VkResult r, const char * what)
@@ -412,4 +412,4 @@ public:
 	}
 };
 
-} // namespace wivrn::hevc::gpu
+} // namespace wivrn::h267::gpu

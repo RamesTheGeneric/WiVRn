@@ -1,7 +1,7 @@
 #include "../../transform.h"
 #include "../vk_compute.h"
 #include <cstdio>
-using namespace wivrn::hevc::gpu;
+using namespace wivrn::h267::gpu;
 int main(int argc,char**argv){
   vk_compute vk; vk.init();
   const uint32_t nb=8192; const int bd=8;
@@ -17,10 +17,10 @@ int main(int argc,char**argv){
     int32_t*gl=(int32_t*)levb.ptr,*gr=(int32_t*)recb.ptr; int fl=0,fr=0;
     for(uint32_t b=0;b<nb;b++){
       int32_t co[64],cl[64],cd[64],cr[64];
-      wivrn::hevc::xform::fdct(rp+b*64,co,8,bd);
-      wivrn::hevc::xform::quant(co,cl,8,qp,bd);
-      wivrn::hevc::xform::dequant(cl,cd,8,qp,bd);
-      wivrn::hevc::xform::idct(cd,cr,8,bd);
+      wivrn::h267::xform::fdct(rp+b*64,co,8,bd);
+      wivrn::h267::xform::quant(co,cl,8,qp,bd);
+      wivrn::h267::xform::dequant(cl,cd,8,qp,bd);
+      wivrn::h267::xform::idct(cd,cr,8,bd);
       for(int i=0;i<64;i++){ if(cl[i]!=gl[b*64+i])fl++; if(cr[i]!=gr[b*64+i])fr++; }
     }
     printf("qp%2d: levels %s (%d)  recon %s (%d)\n",qp,fl?"FAIL":"MATCH",fl,fr?"FAIL":"MATCH",fr);

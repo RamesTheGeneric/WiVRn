@@ -22,7 +22,7 @@
 
 #include <cstdint>
 
-namespace wivrn::hevc
+namespace wivrn::h267
 {
 
 // Encode residual_coding() (Rec. ITU-T H.265 clause 7.3.8.11) for one transform
@@ -34,4 +34,4 @@ namespace wivrn::hevc
 // level (i.e. cbf == 1).
 void residual_coding(cabac_encoder & cb, const int32_t * level, int log2size, int cidx);
 
-} // namespace wivrn::hevc
+} // namespace wivrn::h267

@@ -1,7 +1,7 @@
 #include "../vk_compute.h"
 #include <cstdio>
 #include <vector>
-using namespace wivrn::hevc::gpu;
+using namespace wivrn::h267::gpu;
 // CPU reference predict (verified formulas from cpu_encoder.cpp)
 static void cpu_predict(int mode,int cidx,const int*RT,const int*RL,int*out){
   const int N=8,log2n=3;

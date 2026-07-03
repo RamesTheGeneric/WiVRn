@@ -23,7 +23,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace wivrn::hevc
+namespace wivrn::h267
 {
 
 // Precomputed per-8x8-CU coding data produced by the reconstruction pass (the
@@ -47,4 +47,4 @@ struct block_syntax
 // residual_coding / CABAC engine. (Call build_parameter_sets() separately.)
 std::vector<uint8_t> encode_slice_from_syntax(const hevc_config & cfg, const block_syntax & bs);
 
-} // namespace wivrn::hevc
+} // namespace wivrn::h267

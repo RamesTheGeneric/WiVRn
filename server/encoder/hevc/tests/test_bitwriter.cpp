@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-using namespace wivrn::hevc;
+using namespace wivrn::h267;
 
 static int failures = 0;
 

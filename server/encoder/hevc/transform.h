@@ -27,7 +27,7 @@
 //
 // This reference supports 4x4 and 8x8 DCT-II (the sizes used by the first
 // real-residual encoder: 8x8 luma, 4x4 chroma). All arrays are row-major [y][x].
-namespace wivrn::hevc::xform
+namespace wivrn::h267::xform
 {
 
 // Forward DCT-II of an nxn residual block (n = 4 or 8). in: residual samples
@@ -44,4 +44,4 @@ void quant(const int32_t * coeff, int32_t * level, int n, int qp, int bit_depth)
 // Inverse quantisation (spec 8.6.3): level -> dequantised coefficient.
 void dequant(const int32_t * level, int32_t * coeff, int n, int qp, int bit_depth);
 
-} // namespace wivrn::hevc::xform
+} // namespace wivrn::h267::xform

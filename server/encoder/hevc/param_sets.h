@@ -23,7 +23,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace wivrn::hevc
+namespace wivrn::h267
 {
 
 // HEVC NAL unit types used by this encoder (Rec. ITU-T H.265 Table 7-1).
@@ -87,4 +87,4 @@ std::vector<uint8_t> build_parameter_sets(const hevc_config & cfg);
 // single-slice picture); `first_in_pic` marks the first slice segment.
 void write_slice_header(bitwriter & w, const hevc_config & cfg, uint32_t slice_ctb_addr, bool first_in_pic);
 
-} // namespace wivrn::hevc
+} // namespace wivrn::h267

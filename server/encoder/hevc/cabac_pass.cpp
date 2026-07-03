@@ -23,7 +23,7 @@
 
 #include <vector>
 
-namespace wivrn::hevc
+namespace wivrn::h267
 {
 
 using namespace tables;
@@ -195,4 +195,4 @@ std::vector<uint8_t> encode_slice_from_syntax(const hevc_config & cfg, const blo
 	return sc.run();
 }
 
-} // namespace wivrn::hevc
+} // namespace wivrn::h267

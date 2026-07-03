@@ -20,7 +20,7 @@
 
 #include <cstdlib>
 
-namespace wivrn::hevc::xform
+namespace wivrn::h267::xform
 {
 
 namespace
@@ -170,4 +170,4 @@ void quant(const int32_t * coeff, int32_t * level, int n, int qp, int bit_depth)
 	}
 }
 
-} // namespace wivrn::hevc::xform
+} // namespace wivrn::h267::xform

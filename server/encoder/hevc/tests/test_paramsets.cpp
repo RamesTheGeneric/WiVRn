@@ -13,13 +13,13 @@
 
 int main(int argc, char ** argv)
 {
-	wivrn::hevc::hevc_config cfg;
+	wivrn::h267::hevc_config cfg;
 	cfg.width = argc > 1 ? std::atoi(argv[1]) : 1832;
 	cfg.height = argc > 2 ? std::atoi(argv[2]) : 1920;
 	cfg.bit_depth = argc > 3 ? std::atoi(argv[3]) : 8;
 	cfg.qp = 26;
 
-	auto ps = wivrn::hevc::build_parameter_sets(cfg);
+	auto ps = wivrn::h267::build_parameter_sets(cfg);
 
 	std::fprintf(stderr,
 	             "display %ux%u  coded %ux%u  ctbs %ux%u  bytes %zu\n",

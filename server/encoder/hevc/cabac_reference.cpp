@@ -20,7 +20,7 @@
 
 #include <algorithm>
 
-namespace wivrn::hevc
+namespace wivrn::h267
 {
 
 using namespace tables;
@@ -190,4 +190,4 @@ std::vector<uint8_t> cabac_encoder::finish()
 	return std::move(out);
 }
 
-} // namespace wivrn::hevc
+} // namespace wivrn::h267

@@ -24,7 +24,7 @@
 
 #include <cstdint>
 
-namespace wivrn::hevc::gpu
+namespace wivrn::h267::gpu
 {
 
 // Runs the DC reconstruction wavefront (luma + chroma) on the GPU, turning a
@@ -63,4 +63,4 @@ public:
 	                 uint8_t * recY = nullptr, uint8_t * recCb = nullptr, uint8_t * recCr = nullptr);
 };
 
-} // namespace wivrn::hevc::gpu
+} // namespace wivrn::h267::gpu

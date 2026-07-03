@@ -23,7 +23,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace wivrn::hevc
+namespace wivrn::h267
 {
 
 // A YUV 4:2:0 image at coded (CTB-aligned) dimensions. Luma is width x height;
@@ -46,4 +46,4 @@ struct yuv_image
 // decoder's output bit-for-bit).
 std::vector<uint8_t> encode_intra_frame(const hevc_config & cfg, const yuv_image & src, yuv_image * recon = nullptr);
 
-} // namespace wivrn::hevc
+} // namespace wivrn::h267

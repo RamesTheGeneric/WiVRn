@@ -21,7 +21,7 @@
 #include <algorithm>
 #include <cstring>
 
-namespace wivrn::hevc::gpu
+namespace wivrn::h267::gpu
 {
 
 namespace
@@ -156,4 +156,4 @@ void reconstructor::reconstruct(const hevc_config & cfg,
 	copy_rec(recCr, rCr, (size_t)cw2 * ch2);
 }
 
-} // namespace wivrn::hevc::gpu
+} // namespace wivrn::h267::gpu

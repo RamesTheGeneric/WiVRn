@@ -18,7 +18,7 @@
 
 #include "param_sets.h"
 
-namespace wivrn::hevc
+namespace wivrn::h267
 {
 
 namespace
@@ -245,4 +245,4 @@ void write_slice_header(bitwriter & w, const hevc_config & cfg, uint32_t slice_c
 	w.byte_alignment(); // align so CABAC slice data starts on a byte boundary
 }
 
-} // namespace wivrn::hevc
+} // namespace wivrn::h267

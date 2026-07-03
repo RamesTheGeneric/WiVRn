@@ -20,7 +20,7 @@
 
 #include <cassert>
 
-namespace wivrn::hevc
+namespace wivrn::h267
 {
 
 void bitwriter::put_bit(uint32_t bit)
@@ -133,4 +133,4 @@ void emit_nal(std::vector<uint8_t> & out, int nal_unit_type, const std::vector<u
 	append_ebsp(out, rbsp);
 }
 
-} // namespace wivrn::hevc
+} // namespace wivrn::h267

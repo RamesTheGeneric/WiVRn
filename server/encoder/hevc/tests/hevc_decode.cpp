@@ -19,7 +19,7 @@
 #include <cstring>
 #include <vector>
 
-using namespace wivrn::hevc::tables;
+using namespace wivrn::h267::tables;
 
 // ---- CABAC decode engine (Rec. ITU-T H.265 clause 9.3.4.3) ----
 struct cabac_decoder
@@ -632,8 +632,8 @@ struct decoder
 		if (has_res)
 		{
 			int deq[64], res[64];
-			wivrn::hevc::xform::dequant(level, deq, N, qp, bd);
-			wivrn::hevc::xform::idct(deq, res, N, bd);
+			wivrn::h267::xform::dequant(level, deq, N, qp, bd);
+			wivrn::h267::xform::idct(deq, res, N, bd);
 			for (int i = 0; i < N * N; ++i)
 				rec[i] = clipp(pred[i] + res[i]);
 		}

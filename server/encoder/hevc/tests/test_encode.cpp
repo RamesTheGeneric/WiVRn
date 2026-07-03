@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-using namespace wivrn::hevc;
+using namespace wivrn::h267;
 
 static void write_file(const std::string & path, const void * data, size_t n)
 {

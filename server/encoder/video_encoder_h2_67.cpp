@@ -87,7 +87,7 @@ video_encoder_h2_67::video_encoder_h2_67(
 	cfg.bit_depth = 8;
 	cfg.qp = parse_qp(settings);
 	cfg.max_tb_log2_size = 3;
-	parameter_sets = hevc::build_parameter_sets(cfg);
+	parameter_sets = h267::build_parameter_sets(cfg);
 
 	// Reconstruction runs on WiVRn's shared device with the embedded shaders.
 	const auto & luma_spv = ::shaders.at("hevc_recon_dc_luma");
@@ -217,15 +217,14 @@ std::optional<video_encoder::data> video_encoder_h2_67::encode(uint8_t slot, uin
 	}
 
 	// CPU entropy coding from the level buffers.
-	auto slice = hevc::encode_slice_from_syntax(cfg, bs);
+	auto slice = h267::encode_slice_from_syntax(cfg, bs);
 
 	auto frame = std::make_shared<std::vector<uint8_t>>();
 	frame->reserve(parameter_sets.size() + slice.size());
 	frame->insert(frame->end(), parameter_sets.begin(), parameter_sets.end());
 	frame->insert(frame->end(), slice.begin(), slice.end());
 
-	if (video_dump.is_open())
-		video_dump.write(reinterpret_cast<const char *>(frame->data()), frame->size());
+	// Note: the base class writes the returned span to WIVRN_DUMP_VIDEO in SendData().
 
 	(void)frame_index;
 	return data{

@@ -23,7 +23,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace wivrn::hevc
+namespace wivrn::h267
 {
 
 // Reference CABAC arithmetic encoder (Rec. ITU-T H.265 clause 9.3). This is the
@@ -77,4 +77,4 @@ public:
 	size_t bit_count() const { return out.size() * 8 + nbits; }
 };
 
-} // namespace wivrn::hevc
+} // namespace wivrn::h267

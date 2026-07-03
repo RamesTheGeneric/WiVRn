@@ -4,7 +4,7 @@
 #include <cstring>
 #include <vector>
 #include <cmath>
-using namespace wivrn::hevc;
+using namespace wivrn::h267;
 int main(int argc,char**argv){
   const char*sL=argv[1],*sC=argv[2],*base=argv[3];
   int W=atoi(argv[4]),H=atoi(argv[5]),qp=atoi(argv[6]);

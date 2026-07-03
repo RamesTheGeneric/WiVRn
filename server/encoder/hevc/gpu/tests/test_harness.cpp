@@ -10,7 +10,7 @@
 #include <cstdio>
 #include <vector>
 
-using namespace wivrn::hevc::gpu;
+using namespace wivrn::h267::gpu;
 
 int main(int argc, char ** argv)
 {

@@ -21,7 +21,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace wivrn::hevc
+namespace wivrn::h267
 {
 
 // Bit-level writer producing a Raw Byte Sequence Payload (RBSP), i.e. the
@@ -90,4 +90,4 @@ void append_ebsp(std::vector<uint8_t> & out, const std::vector<uint8_t> & rbsp);
 // RBSP. `rbsp` must already be byte aligned (i.e. end with rbsp_trailing_bits).
 void emit_nal(std::vector<uint8_t> & out, int nal_unit_type, const std::vector<uint8_t> & rbsp);
 
-} // namespace wivrn::hevc
+} // namespace wivrn::h267

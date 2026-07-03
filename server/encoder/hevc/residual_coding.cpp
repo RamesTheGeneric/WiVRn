@@ -21,7 +21,7 @@
 #include <array>
 #include <cstdlib>
 
-namespace wivrn::hevc
+namespace wivrn::h267
 {
 
 using namespace tables;
@@ -341,4 +341,4 @@ void residual_coding(cabac_encoder & cb, const int32_t * level, int log2size, in
 	}
 }
 
-} // namespace wivrn::hevc
+} // namespace wivrn::h267

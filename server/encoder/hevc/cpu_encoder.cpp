@@ -26,7 +26,7 @@
 #include <cstdlib>
 #include <vector>
 
-namespace wivrn::hevc
+namespace wivrn::h267
 {
 
 using namespace tables;
@@ -458,4 +458,4 @@ std::vector<uint8_t> encode_intra_frame(const hevc_config & cfg, const yuv_image
 	return e.run(recon);
 }
 
-} // namespace wivrn::hevc
+} // namespace wivrn::h267
