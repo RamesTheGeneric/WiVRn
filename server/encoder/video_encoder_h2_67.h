@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "hevc/bitwriter.h"
 #include "hevc/cabac_pass.h"
 #include "hevc/gpu/gpu_reconstruct.h"
 #include "hevc/param_sets.h"
@@ -59,8 +60,9 @@ class video_encoder_h2_67 : public video_encoder
 	std::vector<uint8_t> parameter_sets;
 
 	h267::gpu::reconstructor recon;
-	// Reused per-CU syntax across frames (source planes go straight to the GPU).
-	h267::block_syntax bs;
+	int slice_ctb_rows = 2; // CTB rows per independent slice (GPU CABAC parallelism)
+	// Reused per-slice CABAC payloads across frames (recon + entropy run on GPU).
+	std::vector<std::vector<uint8_t>> slice_payloads;
 
 	// Rolling per-stage profile, averaged and logged every prof_window frames.
 	struct profile

@@ -288,6 +288,7 @@ if (WIVRN_BUILD_SERVER)
 			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/foveation.comp"
 			"${CMAKE_CURRENT_SOURCE_DIR}/encoder/hevc/gpu/shaders/hevc_recon_dc_luma.comp"
 			"${CMAKE_CURRENT_SOURCE_DIR}/encoder/hevc/gpu/shaders/hevc_recon_dc_chroma.comp"
+			"${CMAKE_CURRENT_SOURCE_DIR}/encoder/hevc/gpu/shaders/hevc_cabac.comp"
 		)
 
 	target_compile_definitions(wivrn-server PRIVATE JSON_DIAGNOSTICS=1)

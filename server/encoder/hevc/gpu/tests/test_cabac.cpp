@@ -11,6 +11,7 @@
 #include "../../param_sets.h"
 #include "../vk_compute.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -21,7 +22,7 @@ using namespace wivrn::h267::gpu;
 struct PC
 {
 	int32_t qp;
-	uint32_t bw, bh, ctbs_x, ctb_row0, ctb_rows, out_stride, last_slice;
+	uint32_t bw, bh, ctbs_x, ctbs_y, slice_ctb_rows, out_stride;
 };
 
 // Deterministic sparse-but-consistent block_syntax: random small coefficients,
@@ -77,7 +78,7 @@ int main(int argc, char ** argv)
 	const testcase cases[] = {
 	        {128, 128, 26}, {192, 128, 20}, {256, 192, 32}, {320, 256, 12}, {128, 320, 40}};
 
-	int failures = 0;
+	int failures = 0, checks = 0;
 	for (auto tc: cases)
 	{
 		for (uint32_t seed: {1u, 7u, 99u})
@@ -94,68 +95,60 @@ int main(int argc, char ** argv)
 
 			block_syntax bs = make_syntax(nb, seed + tc.w * 131 + tc.h);
 
-			// CPU reference: whole frame as one slice.
-			auto ref = encode_slice_payload(cfg, bs, 0, (int)ny, true);
-
-			// GPU: 1 workgroup covering all CTB rows.
-			const uint32_t stride = (uint32_t)nb * 64u * 2u; // generous byte cap
-			auto bCbfL = vk.make_buffer((size_t)nb * 4);
-			auto bCbfCb = vk.make_buffer((size_t)nb * 4);
-			auto bCbfCr = vk.make_buffer((size_t)nb * 4);
-			auto bLevY = vk.make_buffer((size_t)nb * 64 * 4);
-			auto bLevCb = vk.make_buffer((size_t)nb * 16 * 4);
-			auto bLevCr = vk.make_buffer((size_t)nb * 16 * 4);
-			auto bOut = vk.make_buffer((size_t)stride * 4, /*cached=*/true);
-			auto bLen = vk.make_buffer(4, /*cached=*/true);
-			auto bAvail = vk.make_buffer((size_t)nb * 4);
-
-			for (int i = 0; i < nb; ++i)
+			// Try several slice heights: whole frame, 2 rows/slice, 1 row/slice.
+			for (uint32_t R: {ny, 2u, 1u})
 			{
-				((uint32_t *)bCbfL.ptr)[i] = bs.cbf_luma[i];
-				((uint32_t *)bCbfCb.ptr)[i] = bs.cbf_cb[i];
-				((uint32_t *)bCbfCr.ptr)[i] = bs.cbf_cr[i];
+				const uint32_t nsl = (ny + R - 1) / R;
+				const uint32_t stride = (uint32_t)nb * 64u * 2u; // generous byte cap per slice
+
+				auto bCbfL = vk.make_buffer((size_t)nb * 4);
+				auto bCbfCb = vk.make_buffer((size_t)nb * 4);
+				auto bCbfCr = vk.make_buffer((size_t)nb * 4);
+				auto bLevY = vk.make_buffer((size_t)nb * 64 * 4);
+				auto bLevCb = vk.make_buffer((size_t)nb * 16 * 4);
+				auto bLevCr = vk.make_buffer((size_t)nb * 16 * 4);
+				auto bOut = vk.make_buffer((size_t)stride * nsl * 4, /*cached=*/true);
+				auto bLen = vk.make_buffer((size_t)nsl * 4, /*cached=*/true);
+				auto bAvail = vk.make_buffer((size_t)nb * nsl * 4);
+
+				for (int i = 0; i < nb; ++i)
+				{
+					((uint32_t *)bCbfL.ptr)[i] = bs.cbf_luma[i];
+					((uint32_t *)bCbfCb.ptr)[i] = bs.cbf_cb[i];
+					((uint32_t *)bCbfCr.ptr)[i] = bs.cbf_cr[i];
+				}
+				memcpy(bLevY.ptr, bs.lev_y.data(), (size_t)nb * 64 * 4);
+				memcpy(bLevCb.ptr, bs.lev_cb.data(), (size_t)nb * 16 * 4);
+				memcpy(bLevCr.ptr, bs.lev_cr.data(), (size_t)nb * 16 * 4);
+
+				PC pc{cfg.qp, (uint32_t)bw, (uint32_t)bh, nx, ny, R, stride};
+				vk.run(pipe, {&bCbfL, &bCbfCb, &bCbfCr, &bLevY, &bLevCb, &bLevCr, &bOut, &bLen, &bAvail},
+				       nsl, 1, 1, &pc, sizeof(pc));
+
+				bool all_ok = true;
+				for (uint32_t s = 0; s < nsl; ++s)
+				{
+					const int row0 = (int)(s * R);
+					const int rows = (int)std::min(R, ny - s * R);
+					auto ref = encode_slice_payload(cfg, bs, row0, rows, s + 1 == nsl);
+					uint32_t glen = ((uint32_t *)bLen.ptr)[s];
+					bool ok = (glen == ref.size());
+					if (ok)
+						for (uint32_t i = 0; i < glen; ++i)
+							if ((uint8_t)(((uint32_t *)bOut.ptr)[s * stride + i] & 0xff) != ref[i]) { ok = false; break; }
+					if (not ok) all_ok = false;
+					++checks;
+				}
+				if (not all_ok) ++failures;
+				printf("%dx%d qp%d seed%u R=%u (%u slices): %s\n",
+				       tc.w, tc.h, tc.qp, seed, R, nsl, all_ok ? "OK" : "MISMATCH");
+
+				for (auto * b: {&bCbfL, &bCbfCb, &bCbfCr, &bLevY, &bLevCb, &bLevCr, &bOut, &bLen, &bAvail})
+					vk.destroy_buffer(*b);
 			}
-			memcpy(bLevY.ptr, bs.lev_y.data(), (size_t)nb * 64 * 4);
-			memcpy(bLevCb.ptr, bs.lev_cb.data(), (size_t)nb * 16 * 4);
-			memcpy(bLevCr.ptr, bs.lev_cr.data(), (size_t)nb * 16 * 4);
-
-			PC pc{cfg.qp, (uint32_t)bw, (uint32_t)bh, nx, 0u, ny, stride, 1u};
-			vk.run(pipe, {&bCbfL, &bCbfCb, &bCbfCr, &bLevY, &bLevCb, &bLevCr, &bOut, &bLen, &bAvail},
-			       1, 1, 1, &pc, sizeof(pc));
-
-			uint32_t glen = ((uint32_t *)bLen.ptr)[0];
-			std::vector<uint8_t> gpu(glen);
-			for (uint32_t i = 0; i < glen; ++i)
-				gpu[i] = (uint8_t)(((uint32_t *)bOut.ptr)[i] & 0xff);
-
-			bool ok = (gpu.size() == ref.size());
-			size_t firstdiff = ref.size();
-			if (ok)
-				for (size_t i = 0; i < ref.size(); ++i)
-					if (gpu[i] != ref[i])
-					{
-						ok = false;
-						firstdiff = i;
-						break;
-					}
-
-			printf("%dx%d(coded %dx%d) qp%d seed%u: cpu=%zu gpu=%u  %s",
-			       tc.w, tc.h, cw, ch, tc.qp, seed, ref.size(), glen, ok ? "OK\n" : "MISMATCH");
-			if (not ok)
-			{
-				++failures;
-				if (firstdiff < ref.size())
-					printf("  first diff at byte %zu: cpu=%02x gpu=%02x\n",
-					       firstdiff, ref[firstdiff], firstdiff < gpu.size() ? gpu[firstdiff] : 0);
-				else
-					printf("  size differs\n");
-			}
-
-			for (auto * b: {&bCbfL, &bCbfCb, &bCbfCr, &bLevY, &bLevCb, &bLevCr, &bOut, &bLen, &bAvail})
-				vk.destroy_buffer(*b);
 		}
 	}
 
-	printf("\n%s (%d failures)\n", failures == 0 ? "ALL BYTE-EXACT" : "FAILURES", failures);
+	printf("\n%s (%d slice-checks, %d failures)\n", failures == 0 ? "ALL BYTE-EXACT" : "FAILURES", checks, failures);
 	return failures == 0 ? 0 : 1;
 }

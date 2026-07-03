@@ -12,7 +12,7 @@ layout(set = 0, binding = 0, std430) readonly buffer SrcC { uint v[]; } srcC;
 layout(set = 0, binding = 1, std430) buffer RecC { int v[]; } recC;
 layout(set = 0, binding = 2, std430) writeonly buffer LevC { int v[]; } levC;
 layout(set = 0, binding = 3, std430) writeonly buffer CbfC { uint v[]; } cbfC;
-layout(push_constant) uniform PC { uint w; uint h; int qp; int bit_depth; uint diag; uint bx_start; uint ew; uint eh; uint comp; } pc;
+layout(push_constant) uniform PC { uint w; uint h; int qp; int bit_depth; uint diag; uint bx_start; uint ew; uint eh; uint comp; uint slice_rows_px; } pc;
 
 int srcSample(int sx, int sy)
 {
@@ -64,14 +64,14 @@ void main()
 		for (int yy = 2 * N - 1; yy >= 0; --yy)
 		{
 			int nx = xTb - 1, ny = yTb + yy;
-			bool a = nx >= 0 && ny >= 0 && nx < int(W) && ny < int(H) && (uint(nx / 4) + uint(ny / 4) < pc.diag);
+			bool a = nx >= 0 && ny >= 0 && nx < int(W) && ny < int(H) && (uint(nx / 4) + uint(ny / 4) < pc.diag) && (uint(ny) / pc.slice_rows_px == uint(yTb) / pc.slice_rows_px);
 			sav[idx] = a;
 			seq[idx] = a ? recC.v[ny * int(W) + nx] : 0;
 			++idx;
 		}
 		{
 			int nx = xTb - 1, ny = yTb - 1;
-			bool a = nx >= 0 && ny >= 0 && nx < int(W) && ny < int(H) && (uint(nx / 4) + uint(ny / 4) < pc.diag);
+			bool a = nx >= 0 && ny >= 0 && nx < int(W) && ny < int(H) && (uint(nx / 4) + uint(ny / 4) < pc.diag) && (uint(ny) / pc.slice_rows_px == uint(yTb) / pc.slice_rows_px);
 			sav[idx] = a;
 			seq[idx] = a ? recC.v[ny * int(W) + nx] : 0;
 			++idx;
@@ -79,7 +79,7 @@ void main()
 		for (int xx = 0; xx < 2 * N; ++xx)
 		{
 			int nx = xTb + xx, ny = yTb - 1;
-			bool a = nx >= 0 && ny >= 0 && nx < int(W) && ny < int(H) && (uint(nx / 4) + uint(ny / 4) < pc.diag);
+			bool a = nx >= 0 && ny >= 0 && nx < int(W) && ny < int(H) && (uint(nx / 4) + uint(ny / 4) < pc.diag) && (uint(ny) / pc.slice_rows_px == uint(yTb) / pc.slice_rows_px);
 			sav[idx] = a;
 			seq[idx] = a ? recC.v[ny * int(W) + nx] : 0;
 			++idx;

@@ -35,8 +35,8 @@ namespace wivrn::h267::gpu
 class reconstructor
 {
 	vk_compute vkc;
-	vk_compute::pipeline pl{}, pc{};
-	bool ready = false;
+	vk_compute::pipeline pl{}, pc{}, pcab{};
+	bool ready = false, cabac_ready = false;
 
 	int alloc_cw = 0, alloc_ch = 0;
 	vk_compute::buffer sY{}, rY{}, lY{}, cY{}; // sY: raw uint8 luma (extent)
@@ -44,7 +44,13 @@ class reconstructor
 	vk_compute::buffer rCb{}, lCb{}, cCb{};
 	vk_compute::buffer rCr{}, lCr{}, cCr{};
 
+	// GPU CABAC output buffers (per-slice byte streams + lengths + avail scratch).
+	int cab_slices = 0;
+	uint32_t cab_stride = 0;
+	vk_compute::buffer bOut{}, bLen{}, bAvail{};
+
 	void ensure_buffers(int cw, int ch, int ew, int eh);
+	void ensure_cabac_buffers(int nslices, int nb, uint32_t stride);
 
 public:
 	// Wall-clock breakdown of the last reconstruct() call, in microseconds.
@@ -65,17 +71,35 @@ public:
 	// Offline testing: create an own device and load the two shaders from files.
 	void init_own(const char * luma_spv_path, const char * chroma_spv_path);
 
+	// Add the GPU CABAC pipeline (enables encode_frame). Call after init_*.
+	void init_cabac_adopt(const uint32_t * cabac_spv, size_t cabac_words);
+	void init_cabac_own(const char * cabac_spv_path);
+
 	// Fill bs (levels/cbf, all-DC modes) directly from the raw compositor planes
 	// at extent resolution ew x eh: lumaU8 is the 8-bit Y plane (ew*eh, stride ew),
 	// chromaU8 is the 8-bit interleaved CbCr plane (ew*eh/2, i.e. (ew/2)*(eh/2)
 	// pairs). The shaders edge-clamp-sample these up to the coded size, so no CPU
 	// padding/de-interleaving is needed. recon planes, if non-null, receive the GPU
 	// reconstruction (coded size, one byte per sample).
+	// slice_ctb_rows > 0 partitions the picture into horizontal slices of that
+	// many CTB rows (the last is shorter if it doesn't divide), restricting intra
+	// prediction to within each slice so the reconstruction matches a decoder that
+	// decodes the slices independently. <=0 means a single slice for the frame.
 	void reconstruct(const hevc_config & cfg,
 	                 int ew, int eh,
 	                 const uint8_t * lumaU8, const uint8_t * chromaU8,
 	                 block_syntax & bs,
-	                 uint8_t * recY = nullptr, uint8_t * recCb = nullptr, uint8_t * recCr = nullptr);
+	                 uint8_t * recY = nullptr, uint8_t * recCb = nullptr, uint8_t * recCr = nullptr,
+	                 int slice_ctb_rows = 0);
+
+	// Full GPU path: reconstruct then CABAC-encode entirely on the GPU (the level
+	// buffers never leave the device), returning one CABAC payload per slice. The
+	// caller prepends slice headers + NAL framing. Requires init_cabac_*.
+	void encode_frame(const hevc_config & cfg,
+	                  int ew, int eh,
+	                  const uint8_t * lumaU8, const uint8_t * chromaU8,
+	                  int slice_ctb_rows,
+	                  std::vector<std::vector<uint8_t>> & slice_payloads);
 };
 
 } // namespace wivrn::h267::gpu

@@ -27,12 +27,10 @@ layout(set = 0, binding = 8, std430) buffer Avail { uint v[]; } availb;         
 
 layout(push_constant) uniform PC {
 	int qp;
-	uint bw, bh;      // 8x8 blocks across / down (whole frame)
-	uint ctbs_x;      // CTBs across (whole frame)
-	uint ctb_row0;    // first CTB row of this slice
-	uint ctb_rows;    // CTB rows in this slice
-	uint out_stride;  // uints reserved per slice in outb
-	uint last_slice;  // 1 if this slice ends the picture (final terminate = 1)
+	uint bw, bh;          // 8x8 blocks across / down (whole frame)
+	uint ctbs_x, ctbs_y;  // CTBs across / down (whole frame)
+	uint slice_ctb_rows;  // CTB rows per slice; workgroup s codes rows [s*R, (s+1)*R)
+	uint out_stride;      // uints reserved per slice in outb
 } pc;
 
 #include "cabac_tables.glsl.inc"
@@ -467,19 +465,24 @@ void main()
 	out_base = slice * pc.out_stride;
 	sliceb = slice * (bw * bh);
 
+	uint R = pc.slice_ctb_rows;
+	uint nslices = (pc.ctbs_y + R - 1u) / R;
+	if (slice >= nslices) { outlen.v[slice] = 0u; return; } // guard surplus workgroups
+	uint cy0 = slice * R;
+	uint cy1 = min(cy0 + R, pc.ctbs_y);
+
 	// Clear this slice's availability scratch.
 	for (uint i = 0u; i < bw * bh; ++i) availb.v[sliceb + i] = 0u;
 
 	cb_init(pc.qp);
 
-	uint cy0 = pc.ctb_row0;
-	uint cy1 = pc.ctb_row0 + pc.ctb_rows;
+	// Every slice segment ends with end_of_slice_segment_flag=1 on its last CTB.
 	for (uint cy = cy0; cy < cy1; ++cy)
 		for (uint cx = 0u; cx < pc.ctbs_x; ++cx)
 		{
 			process_ctb(int(cx), int(cy));
-			bool pic_end = (pc.last_slice != 0u) && (cy + 1u == cy1) && (cx + 1u == pc.ctbs_x);
-			encode_terminate(pic_end ? 1 : 0);
+			bool slice_end = (cy + 1u == cy1) && (cx + 1u == pc.ctbs_x);
+			encode_terminate(slice_end ? 1 : 0);
 		}
 	cb_finish();
 	outlen.v[slice] = outpos;

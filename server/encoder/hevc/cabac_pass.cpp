@@ -164,8 +164,10 @@ struct slice_coder
 		}
 	}
 
-	// CABAC payload only (no header/NAL) for CTB rows [row0, row0+rows).
-	std::vector<uint8_t> code(int row0, int rows, bool last)
+	// CABAC payload only (no header/NAL) for CTB rows [row0, row0+rows). Every
+	// slice segment ends with end_of_slice_segment_flag=1 on its last CTB (the
+	// `last` picture-final distinction is carried by the NAL, not the terminate).
+	std::vector<uint8_t> code(int row0, int rows, bool /*last*/)
 	{
 		cb.init(0, cfg.qp);
 		const uint32_t nx = cfg.ctbs_x();
@@ -174,8 +176,8 @@ struct slice_coder
 			for (uint32_t cx = 0; cx < nx; ++cx)
 			{
 				quadtree(cx * 64, cy * 64, 6, 0);
-				const bool pic_end = last && (cy + 1 == cy1) && (cx + 1 == nx);
-				cb.encode_terminate(pic_end ? 1 : 0);
+				const bool slice_end = (cy + 1 == cy1) && (cx + 1 == nx);
+				cb.encode_terminate(slice_end ? 1 : 0);
 			}
 		return cb.finish();
 	}

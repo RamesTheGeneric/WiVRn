@@ -45,14 +45,15 @@ struct push_const
 	uint32_t diag, bx_start;
 	uint32_t ew, eh; // extent (source) dims, this plane's samples
 	uint32_t comp;   // chroma component: 0=Cb, 1=Cr (luma ignores)
+	uint32_t slice_rows_px; // slice height in this plane's pixels (edge-clamps intra prediction to the slice)
 };
 #pragma pack(pop)
 
 // Per-diagonal wavefront steps for a bw x bh block grid. ew/eh are the extent
 // source dims (for in-shader edge-clamp), comp selects the interleaved chroma
-// component.
+// component, slice_rows_px is the slice band height (this plane's pixels).
 std::vector<vk_compute::step> wavefront_steps(int W, int H, int qp, int bw, int bh,
-                                              int ew, int eh, int comp)
+                                              int ew, int eh, int comp, int slice_rows_px)
 {
 	std::vector<vk_compute::step> steps;
 	for (int d = 0; d <= bw + bh - 2; ++d)
@@ -60,7 +61,7 @@ std::vector<vk_compute::step> wavefront_steps(int W, int H, int qp, int bw, int 
 		int bxs = std::max(0, d - (bh - 1));
 		int bxe = std::min(d, bw - 1);
 		push_const pcv{(uint32_t)W, (uint32_t)H, qp, 8, (uint32_t)d, (uint32_t)bxs,
-		               (uint32_t)ew, (uint32_t)eh, (uint32_t)comp};
+		               (uint32_t)ew, (uint32_t)eh, (uint32_t)comp, (uint32_t)slice_rows_px};
 		vk_compute::step s;
 		s.gx = (uint32_t)(bxe - bxs + 1);
 		s.gy = 1;
@@ -71,6 +72,14 @@ std::vector<vk_compute::step> wavefront_steps(int W, int H, int qp, int bw, int 
 	}
 	return steps;
 }
+
+#pragma pack(push, 1)
+struct cabac_pc
+{
+	int32_t qp;
+	uint32_t bw, bh, ctbs_x, ctbs_y, slice_ctb_rows, out_stride;
+};
+#pragma pack(pop)
 } // namespace
 
 void reconstructor::init_adopt(VkPhysicalDevice phys, VkDevice dev, VkQueue queue, uint32_t qfam,
@@ -81,6 +90,18 @@ void reconstructor::init_adopt(VkPhysicalDevice phys, VkDevice dev, VkQueue queu
 	pl = vkc.make_pipeline_from_code(luma_spv, luma_words, 4, sizeof(push_const));
 	pc = vkc.make_pipeline_from_code(chroma_spv, chroma_words, 4, sizeof(push_const));
 	ready = true;
+}
+
+void reconstructor::init_cabac_adopt(const uint32_t * cabac_spv, size_t cabac_words)
+{
+	pcab = vkc.make_pipeline_from_code(cabac_spv, cabac_words, 9, sizeof(cabac_pc));
+	cabac_ready = true;
+}
+
+void reconstructor::init_cabac_own(const char * cabac_spv_path)
+{
+	pcab = vkc.make_pipeline(cabac_spv_path, 9, sizeof(cabac_pc));
+	cabac_ready = true;
 }
 
 void reconstructor::init_own(const char * luma_spv_path, const char * chroma_spv_path)
@@ -124,7 +145,8 @@ void reconstructor::reconstruct(const hevc_config & cfg,
                                 int ew, int eh,
                                 const uint8_t * lumaU8, const uint8_t * chromaU8,
                                 block_syntax & bs,
-                                uint8_t * recY, uint8_t * recCb, uint8_t * recCr)
+                                uint8_t * recY, uint8_t * recCb, uint8_t * recCr,
+                                int slice_ctb_rows)
 {
 	using clk = std::chrono::steady_clock;
 	auto us = [](clk::time_point a, clk::time_point b) {
@@ -134,6 +156,10 @@ void reconstructor::reconstruct(const hevc_config & cfg,
 	const int cw = cfg.coded_width(), ch = cfg.coded_height();
 	const int cw2 = cw / 2, ch2 = ch / 2, bw = cw / 8, bh = ch / 8, nb = bw * bh;
 	const int ew2 = ew / 2, eh2 = eh / 2;
+	// Slice band height in pixels; <=0 means one slice for the whole frame.
+	const int R = slice_ctb_rows > 0 ? slice_ctb_rows : (int)cfg.ctbs_y();
+	const int slice_px_luma = R * 64;
+	const int slice_px_chroma = R * 32;
 	ensure_buffers(cw, ch, ew, eh);
 
 	auto t0 = clk::now();
@@ -143,12 +169,12 @@ void reconstructor::reconstruct(const hevc_config & cfg,
 	std::memcpy(sChroma.ptr, chromaU8, (size_t)ew * eh / 2);
 
 	auto t1 = clk::now();
-	vkc.run_wavefront(pl, {&sY, &rY, &lY, &cY}, wavefront_steps(cw, ch, cfg.qp, bw, bh, ew, eh, 0));
+	vkc.run_wavefront(pl, {&sY, &rY, &lY, &cY}, wavefront_steps(cw, ch, cfg.qp, bw, bh, ew, eh, 0, slice_px_luma));
 	auto t2 = clk::now();
 	const int qc = chroma_qp(cfg.qp);
 	// Both chroma passes read the one interleaved source; comp selects Cb/Cr.
-	vkc.run_wavefront(pc, {&sChroma, &rCb, &lCb, &cCb}, wavefront_steps(cw2, ch2, qc, bw, bh, ew2, eh2, 0));
-	vkc.run_wavefront(pc, {&sChroma, &rCr, &lCr, &cCr}, wavefront_steps(cw2, ch2, qc, bw, bh, ew2, eh2, 1));
+	vkc.run_wavefront(pc, {&sChroma, &rCb, &lCb, &cCb}, wavefront_steps(cw2, ch2, qc, bw, bh, ew2, eh2, 0, slice_px_chroma));
+	vkc.run_wavefront(pc, {&sChroma, &rCr, &lCr, &cCr}, wavefront_steps(cw2, ch2, qc, bw, bh, ew2, eh2, 1, slice_px_chroma));
 	auto t3 = clk::now();
 
 	bs.mode.assign(nb, 1); // DC
@@ -180,6 +206,78 @@ void reconstructor::reconstruct(const hevc_config & cfg,
 	copy_rec(recY, rY, (size_t)cw * ch);
 	copy_rec(recCb, rCb, (size_t)cw2 * ch2);
 	copy_rec(recCr, rCr, (size_t)cw2 * ch2);
+	auto t4 = clk::now();
+
+	last_timings = {us(t0, t1), us(t1, t2), us(t2, t3), us(t3, t4)};
+}
+
+void reconstructor::ensure_cabac_buffers(int nslices, int nb, uint32_t stride)
+{
+	if (cab_slices == nslices && cab_stride == stride)
+		return;
+	for (auto * b: {&bOut, &bLen, &bAvail})
+		vkc.destroy_buffer(*b);
+	bOut = vkc.make_buffer((size_t)stride * nslices * 4, /*cached=*/true); // 1 byte/uint
+	bLen = vkc.make_buffer((size_t)nslices * 4, /*cached=*/true);
+	bAvail = vkc.make_buffer((size_t)nb * nslices * 4);
+	cab_slices = nslices;
+	cab_stride = stride;
+}
+
+void reconstructor::encode_frame(const hevc_config & cfg,
+                                 int ew, int eh,
+                                 const uint8_t * lumaU8, const uint8_t * chromaU8,
+                                 int slice_ctb_rows,
+                                 std::vector<std::vector<uint8_t>> & slice_payloads)
+{
+	using clk = std::chrono::steady_clock;
+	auto us = [](clk::time_point a, clk::time_point b) {
+		return std::chrono::duration<double, std::micro>(b - a).count();
+	};
+
+	const int cw = cfg.coded_width(), ch = cfg.coded_height();
+	const int cw2 = cw / 2, ch2 = ch / 2, bw = cw / 8, bh = ch / 8;
+	const int ew2 = ew / 2, eh2 = eh / 2;
+	const int R = slice_ctb_rows > 0 ? slice_ctb_rows : (int)cfg.ctbs_y();
+	const int slice_px_luma = R * 64, slice_px_chroma = R * 32;
+	const uint32_t nx = cfg.ctbs_x(), ny = cfg.ctbs_y();
+	const int nslices = (ny + R - 1) / R;
+	ensure_buffers(cw, ch, ew, eh);
+
+	auto t0 = clk::now();
+	std::memcpy(sY.ptr, lumaU8, (size_t)ew * eh);
+	std::memcpy(sChroma.ptr, chromaU8, (size_t)ew * eh / 2);
+
+	// Reconstruction wavefronts fill the GPU level/cbf buffers (no host readback).
+	auto t1 = clk::now();
+	vkc.run_wavefront(pl, {&sY, &rY, &lY, &cY}, wavefront_steps(cw, ch, cfg.qp, bw, bh, ew, eh, 0, slice_px_luma));
+	const int qc = chroma_qp(cfg.qp);
+	vkc.run_wavefront(pc, {&sChroma, &rCb, &lCb, &cCb}, wavefront_steps(cw2, ch2, qc, bw, bh, ew2, eh2, 0, slice_px_chroma));
+	vkc.run_wavefront(pc, {&sChroma, &rCr, &lCr, &cCr}, wavefront_steps(cw2, ch2, qc, bw, bh, ew2, eh2, 1, slice_px_chroma));
+	auto t2 = clk::now();
+
+	// GPU CABAC reads the recon's level/cbf buffers directly. Per-slice byte cap =
+	// one slice's pixel count (compressed is well under raw) plus margin.
+	const uint32_t stride = (uint32_t)cw * (uint32_t)(R * 64) + 4096u;
+	ensure_cabac_buffers(nslices, bw * bh, stride);
+	cabac_pc pcv{cfg.qp, (uint32_t)bw, (uint32_t)bh, nx, ny, (uint32_t)R, stride};
+	vkc.run(pcab, {&cY, &cCb, &cCr, &lY, &lCb, &lCr, &bOut, &bLen, &bAvail},
+	        (uint32_t)nslices, 1, 1, &pcv, sizeof(pcv));
+	auto t3 = clk::now();
+
+	// Read back the compressed per-slice payloads (small).
+	slice_payloads.resize(nslices);
+	const uint32_t * lens = (const uint32_t *)bLen.ptr;
+	const uint32_t * obytes = (const uint32_t *)bOut.ptr;
+	for (int s = 0; s < nslices; ++s)
+	{
+		const uint32_t len = lens[s];
+		auto & p = slice_payloads[s];
+		p.resize(len);
+		const uint32_t * src = obytes + (size_t)s * stride;
+		for (uint32_t i = 0; i < len; ++i)
+			p[i] = (uint8_t)(src[i] & 0xff);
+	}
 	auto t4 = clk::now();
 
 	last_timings = {us(t0, t1), us(t1, t2), us(t2, t3), us(t3, t4)};
