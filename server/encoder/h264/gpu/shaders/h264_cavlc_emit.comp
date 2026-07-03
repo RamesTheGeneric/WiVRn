@@ -1,12 +1,19 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
-// Parallel CAVLC emit (PyroWave-style): one invocation per macroblock writes its
-// complete CAVLC bit string into a per-MB scratch region and records its bit
-// length. CAVLC has no serial cross-MB bitstream state — the nC contexts come
-// from the neighbours' coefficient COUNTS (the nnz grid from the recon pass) —
-// so every MB is independent. A later prefix-sum + stitch concatenates them.
-// Faithful port of cpu_encoder264's per-MB syntax + cavlc.cpp residual_block.
-layout(local_size_x = 64) in;
+// Parallel CAVLC emit (PyroWave-style, intra-MB parallel): one WORKGROUP of 32
+// lanes per macroblock. An MB's bitstream is a fixed concatenation of up to 28
+// independent "segments" -- the MB header, the luma DC block, 16 luma AC blocks,
+// 2 chroma DC blocks and 8 chroma AC blocks. Each lane owns one segment: it
+// computes its segment's bit length (count pass), a tiny 28-element prefix-sum
+// gives per-segment bit offsets, then each lane re-runs its segment writing the
+// bits at its offset into the per-MB scratch (atomicOr merges the shared
+// boundary words). CAVLC has no serial cross-MB state (nC comes from neighbour
+// coefficient COUNTS in the recon nnz grid), and within an MB the segments are
+// independent, so this exposes ~28x more parallelism than one-lane-per-MB.
+// Faithful port of cpu_encoder264's per-MB syntax + cavlc.cpp residual_block:
+// count and write share the exact same code path (put_bit mode flag) so they
+// cannot diverge.
+layout(local_size_x = 32) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer LDC { int v[]; } ldc;   // [nmb*16]
 layout(set = 0, binding = 1, std430) readonly buffer LAC { int v[]; } lac;   // [nmb*256]
@@ -28,21 +35,23 @@ layout(push_constant) uniform PC {
 const int zblk_bx[16] = int[16](0, 1, 0, 1, 2, 3, 2, 3, 0, 1, 0, 1, 2, 3, 2, 3);
 const int zblk_by[16] = int[16](0, 0, 1, 1, 0, 0, 1, 1, 2, 2, 3, 3, 2, 2, 3, 3);
 
-// ---- per-invocation bit writer ----
-uint wbase;   // scratch word base for this MB
-uint wcur;    // current word accumulator (MSB-first)
-int wn;       // bits in wcur
-uint wword;   // next word index within the MB region
-uint wbits;   // total bits written
+// ---- per-invocation bit sink (per lane / per segment) ----
+// bw_mode 0 = count only; 1 = pack into lbuf (MSB-first, word 0 = first bits).
+int  bw_mode;
+uint lbuf[24];   // one segment's bits; max ~600 bits for a dense 4x4 block
+uint bw_cur; int bw_n; uint bw_word; uint bw_bits;
 
+void bw_reset() { bw_cur = 0u; bw_n = 0; bw_word = 0u; bw_bits = 0u; }
 void put_bit(uint b)
 {
-	wcur = (wcur << 1) | (b & 1u);
-	++wbits;
-	if (++wn == 32) { scratch.v[wbase + wword] = wcur; ++wword; wcur = 0u; wn = 0; }
+	++bw_bits;
+	if (bw_mode == 1) {
+		bw_cur = (bw_cur << 1) | (b & 1u);
+		if (++bw_n == 32) { lbuf[bw_word] = bw_cur; ++bw_word; bw_cur = 0u; bw_n = 0; }
+	}
 }
 void put_bits(uint v, int n) { for (int i = n - 1; i >= 0; --i) put_bit((v >> uint(i)) & 1u); }
-void flush() { if (wn > 0) { scratch.v[wbase + wword] = wcur << uint(32 - wn); ++wword; wcur = 0u; wn = 0; } }
+void bw_flush_local() { if (bw_n > 0) { lbuf[bw_word] = bw_cur << uint(32 - bw_n); ++bw_word; bw_cur = 0u; bw_n = 0; } }
 
 void put_ue(uint v)
 {
@@ -92,8 +101,6 @@ int lev(int scanRaster)
 	return cac.v[g_base + uint(scanRaster)];
 }
 
-// scanMap: for count==16 (luma DC) scanRaster=zigzag4[s]; count==15 (AC) =zigzag4[s+1];
-//          count==4 (chroma DC) raster=s.
 void residual_block(int count, int nC, bool chroma_dc, int scankind)
 {
 	int run[16]; int lvl[16];
@@ -161,57 +168,118 @@ int nC_chroma(int comp, int gx, int gy)
 	return 0;
 }
 
-void main()
+// ---- shared per-MB state ----
+shared uint hnz[32];   // per-segment "has any relevant nonzero" (for cbp)
+shared uint seglen[32]; // per-segment bit length
+shared uint segoff[32]; // per-segment absolute bit offset within the MB
+shared int  s_cbpL, s_cbpC;
+shared uint s_total;
+
+// Run segment `seg` for macroblock (mbx,mby) in the given bw_mode; returns its
+// bit length. seg 0 = header, seg 1 = luma DC, 2..17 = luma AC (zig block
+// order), 18..19 = chroma DC (Cb,Cr), 20..27 = chroma AC (Cb0..3, Cr0..3).
+uint run_segment(uint seg, uint mb, uint mbx, uint mby, int cbpL, int cbpC, int mode)
 {
-	uint mb = gl_GlobalInvocationID.x;
-	uint nmb = pc.mbw * pc.mbh;
-	if (mb >= nmb) return;
-	uint mbx = mb % pc.mbw, mby = mb / pc.mbw;
-	wbase = mb * pc.stride_words; wcur = 0u; wn = 0; wword = 0u; wbits = 0u;
-
-	// cbp
-	bool anyLAC = false;
-	for (int b = 0; b < 16; ++b) for (int k = 1; k < 16; ++k) if (lac.v[mb * 256u + uint(b) * 16u + uint(k)] != 0) anyLAC = true;
-	bool anyCAC = false, anyCDC = false;
-	for (int i = 0; i < 128; ++i) { int bb = i & 15; if (bb != 0 && cac.v[mb * 128u + uint(i)] != 0) anyCAC = true; }
-	for (int i = 0; i < 8; ++i) if (cdc.v[mb * 8u + uint(i)] != 0) anyCDC = true;
-	int cbpLuma = anyLAC ? 15 : 0;
-	int cbpChroma = anyCAC ? 2 : (anyCDC ? 1 : 0);
-	int mb_type = 1 + 2 + 4 * cbpChroma + 12 * ((cbpLuma == 15) ? 1 : 0);
-
-	put_ue(uint(mb_type));
-	put_ue(0u); // intra_chroma_pred_mode = DC
-	put_se(0);  // mb_qp_delta
-
-	// Intra16x16DCLevel (nC = block 0)
-	g_which = 0; g_base = mb * 16u;
-	residual_block(16, nC_luma(int(mbx) * 4, int(mby) * 4), false, 0);
-	// Intra16x16ACLevel
-	if (cbpLuma != 0) {
-		for (int zi = 0; zi < 16; ++zi) {
+	bw_mode = mode; bw_reset();
+	if (seg == 0u) {
+		int mb_type = 1 + 2 + 4 * cbpC + 12 * ((cbpL == 15) ? 1 : 0);
+		put_ue(uint(mb_type));
+		put_ue(0u); // intra_chroma_pred_mode = DC
+		put_se(0);  // mb_qp_delta
+	} else if (seg == 1u) {
+		g_which = 0; g_base = mb * 16u;
+		residual_block(16, nC_luma(int(mbx) * 4, int(mby) * 4), false, 0);
+	} else if (seg <= 17u) {
+		if (cbpL != 0) {
+			int zi = int(seg) - 2;
 			int bx = zblk_bx[zi], by = zblk_by[zi];
 			g_which = 1; g_base = mb * 256u + uint(by * 4 + bx) * 16u;
 			residual_block(15, nC_luma(int(mbx) * 4 + bx, int(mby) * 4 + by), false, 1);
 		}
-	}
-	// Chroma DC (Cb, Cr), nC = -1
-	if ((cbpChroma & 3) != 0) {
-		for (int comp = 0; comp < 2; ++comp) {
+	} else if (seg <= 19u) {
+		if ((cbpC & 3) != 0) {
+			int comp = int(seg) - 18;
 			g_which = 2; g_base = mb * 8u + uint(comp) * 4u;
 			residual_block(4, -1, true, 2);
 		}
-	}
-	// Chroma AC
-	if ((cbpChroma & 2) != 0) {
-		for (int comp = 0; comp < 2; ++comp) {
-			for (int sb = 0; sb < 4; ++sb) {
-				int bx = sb & 1, by = sb >> 1;
-				g_which = 3; g_base = mb * 128u + uint(comp) * 64u + uint(sb) * 16u;
-				residual_block(15, nC_chroma(comp, int(mbx) * 2 + bx, int(mby) * 2 + by), false, 1);
-			}
+	} else {
+		if ((cbpC & 2) != 0) {
+			int idx = int(seg) - 20;
+			int comp = idx / 4, sb = idx % 4;
+			int bx = sb & 1, by = sb >> 1;
+			g_which = 3; g_base = mb * 128u + uint(comp) * 64u + uint(sb) * 16u;
+			residual_block(15, nC_chroma(comp, int(mbx) * 2 + bx, int(mby) * 2 + by), false, 1);
 		}
 	}
+	if (mode == 1) bw_flush_local();
+	return bw_bits;
+}
 
-	flush();
-	bitLen.v[mb] = wbits;
+void main()
+{
+	uint seg = gl_LocalInvocationID.x; // 0..31
+	uint mb = gl_WorkGroupID.x;
+	uint nmb = pc.mbw * pc.mbh;
+	if (mb >= nmb) return;
+	uint mbx = mb % pc.mbw, mby = mb / pc.mbw;
+	uint wbase = mb * pc.stride_words;
+
+	// ---- phase 0: per-segment "has nonzero" for cbp ----
+	uint nz = 0u;
+	if (seg >= 2u && seg <= 17u) {           // luma AC blocks
+		int zi = int(seg) - 2;
+		int bx = zblk_bx[zi], by = zblk_by[zi];
+		uint bb = mb * 256u + uint(by * 4 + bx) * 16u;
+		for (int k = 1; k < 16; ++k) if (lac.v[bb + uint(k)] != 0) nz = 1u;
+	} else if (seg >= 18u && seg <= 19u) {   // chroma DC (Cb, Cr)
+		uint bb = mb * 8u + uint(int(seg) - 18) * 4u;
+		for (int k = 0; k < 4; ++k) if (cdc.v[bb + uint(k)] != 0) nz = 1u;
+	} else if (seg >= 20u && seg <= 27u) {   // chroma AC
+		int idx = int(seg) - 20;
+		uint bb = mb * 128u + uint(idx / 4) * 64u + uint(idx % 4) * 16u;
+		for (int k = 1; k < 16; ++k) if (cac.v[bb + uint(k)] != 0) nz = 1u;
+	}
+	hnz[seg] = nz;
+	barrier();
+	if (seg == 0u) {
+		uint anyLAC = 0u; for (uint i = 2u; i <= 17u; ++i) anyLAC |= hnz[i];
+		uint anyCDC = 0u; for (uint i = 18u; i <= 19u; ++i) anyCDC |= hnz[i];
+		uint anyCAC = 0u; for (uint i = 20u; i <= 27u; ++i) anyCAC |= hnz[i];
+		s_cbpL = (anyLAC != 0u) ? 15 : 0;
+		s_cbpC = (anyCAC != 0u) ? 2 : ((anyCDC != 0u) ? 1 : 0);
+	}
+	barrier();
+	int cbpL = s_cbpL, cbpC = s_cbpC;
+
+	// ---- phase 1: per-segment bit length (count pass) ----
+	seglen[seg] = (seg < 28u) ? run_segment(seg, mb, mbx, mby, cbpL, cbpC, 0) : 0u;
+	barrier();
+
+	// ---- phase 2: exclusive prefix-sum over the 28 segments (lane 0) ----
+	if (seg == 0u) {
+		uint acc = 0u;
+		for (uint i = 0u; i < 28u; ++i) { segoff[i] = acc; acc += seglen[i]; }
+		s_total = acc;
+	}
+	barrier();
+
+	// zero only the words the writes will touch (ceil(total/32)+1), then barrier
+	// before the atomicOr writes. Sparse MBs use a handful of words, not all 256.
+	uint nw = min((s_total + 31u) / 32u + 1u, pc.stride_words);
+	for (uint i = seg; i < nw; i += 32u) scratch.v[wbase + i] = 0u;
+	barrier();
+
+	// ---- phase 3: write each segment's bits at its offset (write pass) ----
+	if (seg < 28u && seglen[seg] > 0u) {
+		run_segment(seg, mb, mbx, mby, cbpL, cbpC, 1); // fills lbuf[0..bw_word)
+		uint off = segoff[seg];
+		uint w0 = off >> 5u, sh = off & 31u;
+		for (uint i = 0u; i < bw_word; ++i) {
+			uint val = lbuf[i];
+			atomicOr(scratch.v[wbase + w0 + i], val >> sh);
+			if (sh != 0u && (w0 + i + 1u) < pc.stride_words)
+				atomicOr(scratch.v[wbase + w0 + i + 1u], val << (32u - sh));
+		}
+	}
+	if (seg == 0u) bitLen.v[mb] = s_total;
 }

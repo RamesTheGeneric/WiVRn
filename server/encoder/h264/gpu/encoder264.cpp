@@ -160,7 +160,8 @@ std::vector<uint8_t> encoder::encode_frame(const h264_config & cfg, int ew, int 
 	vkc.record_timestamp(b); // ts0: after clears, before recon
 	vkc.record_dispatch(b, recon, rbind, recon_wg, 1, 1, &rpc, sizeof(rpc), /*leading_barrier=*/false);
 	vkc.record_timestamp(b); // ts1: recon done
-	vkc.record_dispatch(b, emit, {&lDC, &lAC, &cDC, &cAC, &nnzL, &nnzC, &scratch, &bitLen}, groups, 1, 1, &epc, sizeof(epc), true);
+	// emit is now one workgroup (32 lanes) per MB: intra-MB parallel over segments.
+	vkc.record_dispatch(b, emit, {&lDC, &lAC, &cDC, &cAC, &nnzL, &nnzC, &scratch, &bitLen}, (uint32_t)nmb, 1, 1, &epc, sizeof(epc), true);
 	vkc.record_timestamp(b); // ts2: emit done
 	vkc.record_dispatch(b, prefix, {&bitLen, &offset, &total}, 1, 1, 1, &ppc, sizeof(ppc), true);
 	vkc.record_timestamp(b); // ts3: prefix done
