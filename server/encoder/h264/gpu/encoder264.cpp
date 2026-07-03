@@ -154,25 +154,27 @@ std::vector<uint8_t> encoder::encode_frame(const h264_config & cfg, int ew, int 
 	static const bool gpu_prof = std::getenv("WIVRN_H264_GPU_TIMESTAMPS") != nullptr;
 	vkc.profile_gpu = gpu_prof;
 	auto b = vkc.begin_batch();
+	vkc.record_timestamp(b); // ts0: batch start (before fills)
 	vkc.record_fill(b, outbits, (size_t)nmb * stride_words * 4, 0);
 	vkc.record_fill(b, claim, 4, 0);                 // claim counter = 0
 	vkc.record_fill(b, doneBuf, (size_t)nmb * 4, 0); // per-MB done flags = 0
-	vkc.record_timestamp(b); // ts0: after clears, before recon
+	vkc.record_timestamp(b); // ts1: fills done, before recon
 	vkc.record_dispatch(b, recon, rbind, recon_wg, 1, 1, &rpc, sizeof(rpc), /*leading_barrier=*/false);
-	vkc.record_timestamp(b); // ts1: recon done
+	vkc.record_timestamp(b); // ts2: recon done
 	// emit is now one workgroup (32 lanes) per MB: intra-MB parallel over segments.
 	vkc.record_dispatch(b, emit, {&lDC, &lAC, &cDC, &cAC, &nnzL, &nnzC, &scratch, &bitLen}, (uint32_t)nmb, 1, 1, &epc, sizeof(epc), true);
-	vkc.record_timestamp(b); // ts2: emit done
+	vkc.record_timestamp(b); // ts3: emit done
 	vkc.record_dispatch(b, prefix, {&bitLen, &offset, &total}, 1, 1, 1, &ppc, sizeof(ppc), true);
-	vkc.record_timestamp(b); // ts3: prefix done
+	vkc.record_timestamp(b); // ts4: prefix done
 	vkc.record_dispatch(b, stitch, {&scratch, &bitLen, &offset, &outbits}, groups, 1, 1, &spc, sizeof(spc), true);
-	vkc.record_timestamp(b); // ts4: stitch done
+	vkc.record_timestamp(b); // ts5: stitch done
 	vkc.submit_and_wait(b);
-	const double gpu_recon_us = vkc.ts_us(b, 0, 1);
-	const double gpu_cavlc_us = vkc.ts_us(b, 1, 4);
-	const double gpu_emit_us = vkc.ts_us(b, 1, 2);
-	const double gpu_prefix_us = vkc.ts_us(b, 2, 3);
-	const double gpu_stitch_us = vkc.ts_us(b, 3, 4);
+	const double gpu_fills_us = vkc.ts_us(b, 0, 1);
+	const double gpu_recon_us = vkc.ts_us(b, 1, 2);
+	const double gpu_cavlc_us = vkc.ts_us(b, 2, 5);
+	const double gpu_emit_us = vkc.ts_us(b, 2, 3);
+	const double gpu_prefix_us = vkc.ts_us(b, 3, 4);
+	const double gpu_stitch_us = vkc.ts_us(b, 4, 5);
 	const uint32_t totbits = ((const uint32_t *)total.ptr)[0]; // header + payload bits
 
 	auto t2 = clk::now();
@@ -213,7 +215,7 @@ std::vector<uint8_t> encoder::encode_frame(const h264_config & cfg, int ew, int 
 	const double recon_report = gpu_prof ? gpu_recon_us : us(t1, t2);
 	const double cavlc_report = gpu_prof ? gpu_cavlc_us : 0.0;
 	last_timings = {us(t0, t1), recon_report, cavlc_report, us(t3, clk::now()),
-	                gpu_emit_us, gpu_prefix_us, gpu_stitch_us};
+	                gpu_emit_us, gpu_prefix_us, gpu_stitch_us, gpu_fills_us};
 	return frame;
 }
 

@@ -25,10 +25,10 @@ using namespace wivrn::avc;
 using namespace wivrn::h267::gpu;
 using bw = wivrn::h267::bitwriter;
 
-struct RPC { uint32_t mbw, mbh; int32_t qp, qpc; uint32_t cw, ch, ew, eh, diag, mbx_start; };
+struct RPC { uint32_t mbw, mbh; int32_t qp, qpc; uint32_t cw, ch, ew, eh, nmb; };
 struct EPC { uint32_t mbw, mbh, stride_words, lgw, cgw, cgh; };
 
-struct PPC { uint32_t nmb; };
+struct PPC { uint32_t nmb, base_bits; };
 struct SPC { uint32_t nmb, stride_words; };
 
 int main(int argc, char ** argv)
@@ -37,7 +37,7 @@ int main(int argc, char ** argv)
 	const char * pspv = argc > 3 ? argv[3] : nullptr, *sspv = argc > 4 ? argv[4] : nullptr;
 	vk_compute vk;
 	vk.init();
-	auto rpipe = vk.make_pipeline(rspv, 11, sizeof(RPC));
+	auto rpipe = vk.make_pipeline(rspv, 14, sizeof(RPC));
 	auto epipe = vk.make_pipeline(espv, 8, sizeof(EPC));
 	bool haveStitch = pspv && sspv;
 	vk_compute::pipeline ppipe{}, spipe{};
@@ -82,22 +82,26 @@ int main(int argc, char ** argv)
 			c[((size_t)y * cw2 + x) * 2 + 0] = img.Cb[(size_t)y * cw2 + x];
 			c[((size_t)y * cw2 + x) * 2 + 1] = img.Cr[(size_t)y * cw2 + x]; } }
 
-		// recon
+		// recon (scoreboard: single dispatch of persistent workgroups)
 		const int qpc = wivrn::avc::xform::chroma_qp(t.qp);
-		std::vector<vk_compute::buffer *> rbind = {&bSY, &bSC, &bRY, &bRCb, &bRCr, &bLDC, &bLAC, &bCDC, &bCAC, &bNL, &bNC};
-		std::vector<vk_compute::step> rsteps;
-		for (int d = 0; d <= mbw + mbh - 2; ++d) {
-			int s = std::max(0, d - (mbh - 1)), e = std::min(d, mbw - 1);
-			RPC pc{(uint32_t)mbw, (uint32_t)mbh, t.qp, qpc, (uint32_t)cw, (uint32_t)ch, (uint32_t)ew, (uint32_t)eh, (uint32_t)d, (uint32_t)s};
-			vk_compute::step st; st.gx = (uint32_t)(e - s + 1); st.gy = 1; st.gz = 1;
-			st.push.resize(sizeof(pc)); memcpy(st.push.data(), &pc, sizeof(pc)); rsteps.push_back(std::move(st));
+		auto bOrd = vk.make_buffer((size_t)nmb * 4);
+		auto bClaim = vk.make_buffer(4, true);
+		auto bDone = vk.make_buffer((size_t)nmb * 4, true);
+		{
+			auto * ord = (uint32_t *)bOrd.ptr; uint32_t k = 0;
+			for (int d = 0; d <= mbw + mbh - 2; ++d)
+				for (int mbx = std::max(0, d - (mbh - 1)); mbx <= std::min(d, mbw - 1); ++mbx)
+					ord[k++] = uint32_t((d - mbx) * mbw + mbx);
+			memset(bClaim.ptr, 0, 4); memset(bDone.ptr, 0, (size_t)nmb * 4);
 		}
-		vk.run_wavefront(rpipe, rbind, rsteps);
+		std::vector<vk_compute::buffer *> rbind = {&bSY, &bSC, &bRY, &bRCb, &bRCr, &bLDC, &bLAC, &bCDC, &bCAC, &bNL, &bNC, &bOrd, &bClaim, &bDone};
+		RPC rpc{(uint32_t)mbw, (uint32_t)mbh, t.qp, qpc, (uint32_t)cw, (uint32_t)ch, (uint32_t)ew, (uint32_t)eh, (uint32_t)nmb};
+		vk.run(rpipe, rbind, std::min(nmb, 64), 1, 1, &rpc, sizeof(rpc));
 
 		// emit
 		EPC epc{(uint32_t)mbw, (uint32_t)mbh, STRIDE, (uint32_t)(cw / 4), (uint32_t)(cw / 8), (uint32_t)(ch / 8)};
 		std::vector<vk_compute::buffer *> ebind = {&bLDC, &bLAC, &bCDC, &bCAC, &bNL, &bNC, &bScratch, &bBitLen};
-		vk.run(epipe, ebind, (uint32_t)((nmb + 63) / 64), 1, 1, &epc, sizeof(epc));
+		vk.run(epipe, ebind, (uint32_t)nmb, 1, 1, &epc, sizeof(epc)); // one workgroup (32 lanes) per MB
 
 		// Optional GPU stitch: prefix-sum + parallel bit-concatenation, compared to
 		// a CPU concatenation of the same per-MB bits.
@@ -106,7 +110,7 @@ int main(int argc, char ** argv)
 			auto bOff = vk.make_buffer((size_t)nmb * 4, true);
 			auto bTot = vk.make_buffer(4, true);
 			auto bOut = vk.make_buffer((size_t)nmb * STRIDE * 4, true); // generous, zeroed
-			PPC ppc{(uint32_t)nmb};
+			PPC ppc{(uint32_t)nmb, 0u}; // base_bits=0: CPU concat below also starts at bit 0
 			vk.run(ppipe, {&bBitLen, &bOff, &bTot}, 1, 1, 1, &ppc, sizeof(ppc));
 			SPC spc{(uint32_t)nmb, STRIDE};
 			vk.run(spipe, {&bScratch, &bBitLen, &bOff, &bOut}, (uint32_t)((nmb + 63) / 64), 1, 1, &spc, sizeof(spc));
@@ -168,7 +172,7 @@ int main(int argc, char ** argv)
 		printf("%dx%d qp%d: gpu=%zu cpu=%zu byteExact=%d gpuStitch=%d decode=%s mism=%d  %s\n",
 		       t.w, t.h, t.qp, frameGPU.size(), frameCPU.size(), byteExact ? 1 : 0, stitchOK ? 1 : 0, dec ? "ok" : "FAIL", mism, pass ? "PASS" : "FAIL");
 
-		for (auto * bb : {&bSY, &bSC, &bRY, &bRCb, &bRCr, &bLDC, &bLAC, &bCDC, &bCAC, &bNL, &bNC, &bScratch, &bBitLen}) vk.destroy_buffer(*bb);
+		for (auto * bb : {&bSY, &bSC, &bRY, &bRCb, &bRCr, &bLDC, &bLAC, &bCDC, &bCAC, &bNL, &bNC, &bScratch, &bBitLen, &bOrd, &bClaim, &bDone}) vk.destroy_buffer(*bb);
 	}
 	printf("\n%s (%d failures)\n", fails == 0 ? "GPU CAVLC BYTE-EXACT + DECODE PIXEL-EXACT" : "FAILURES", fails);
 	return fails ? 1 : 0;

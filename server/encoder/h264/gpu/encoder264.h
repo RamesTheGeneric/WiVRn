@@ -70,7 +70,7 @@ public:
 
 	// Timing (microseconds) of the last encode_frame's stages.
 	struct timings { double upload = 0, recon_us = 0, cavlc_us = 0, assemble_us = 0;
-	                 double emit_us = 0, prefix_us = 0, stitch_us = 0; } last_timings{};
+	                 double emit_us = 0, prefix_us = 0, stitch_us = 0, fills_us = 0; } last_timings{};
 };
 
 } // namespace wivrn::avc::gpu
