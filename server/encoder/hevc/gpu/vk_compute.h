@@ -50,8 +50,9 @@ public:
 	VkQueue queue = VK_NULL_HANDLE;
 	uint32_t qfam = 0;
 	VkCommandPool pool = VK_NULL_HANDLE;
-	uint32_t host_mem_type = ~0u;
-	bool owns_device = false; // true when init() created the device/instance
+	uint32_t host_mem_type = ~0u;      // HOST_VISIBLE|COHERENT — fast CPU writes (uploads)
+	uint32_t host_read_mem_type = ~0u; // + HOST_CACHED — fast CPU reads (readback)
+	bool owns_device = false;          // true when init() created the device/instance
 
 	struct buffer
 	{
@@ -171,19 +172,29 @@ private:
 		VkPhysicalDeviceMemoryProperties mp;
 		vkGetPhysicalDeviceMemoryProperties(phys, &mp);
 		const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+		const VkMemoryPropertyFlags want_cached = want | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
 		for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
-			if ((mp.memoryTypes[i].propertyFlags & want) == want)
-			{
+		{
+			auto f = mp.memoryTypes[i].propertyFlags;
+			if (host_mem_type == ~0u && (f & want) == want)
 				host_mem_type = i;
-				break;
-			}
+			// Prefer a coherent+cached type: fast CPU reads with no manual
+			// invalidation. On this APU the plain coherent type is write-combined,
+			// which reads at ~100 MB/s and dominated the encode time.
+			if (host_read_mem_type == ~0u && (f & want_cached) == want_cached)
+				host_read_mem_type = i;
+		}
 		if (host_mem_type == ~0u)
 			throw std::runtime_error("no host-visible coherent memory");
+		if (host_read_mem_type == ~0u)
+			host_read_mem_type = host_mem_type; // no cached type; fall back
 	}
 
 public:
 
-	buffer make_buffer(size_t bytes)
+	// cached=true picks HOST_CACHED memory (fast CPU reads) for buffers the CPU
+	// reads back; leave false for write-mostly upload buffers.
+	buffer make_buffer(size_t bytes, bool cached = false)
 	{
 		buffer b;
 		b.size = bytes;
@@ -196,7 +207,7 @@ public:
 		vkGetBufferMemoryRequirements(dev, b.buf, &req);
 		VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
 		mai.allocationSize = req.size;
-		mai.memoryTypeIndex = host_mem_type;
+		mai.memoryTypeIndex = cached ? host_read_mem_type : host_mem_type;
 		vkcheck(vkAllocateMemory(dev, &mai, nullptr, &b.mem), "vkAllocateMemory");
 		vkcheck(vkBindBufferMemory(dev, b.buf, b.mem, 0), "vkBindBufferMemory");
 		vkcheck(vkMapMemory(dev, b.mem, 0, bytes, 0, &b.ptr), "vkMapMemory");

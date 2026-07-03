@@ -19,6 +19,7 @@
 #include "gpu_reconstruct.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 namespace wivrn::h267::gpu
@@ -92,16 +93,21 @@ void reconstructor::ensure_buffers(int cw, int ch)
 		vkc.destroy_buffer(*b);
 
 	const int cw2 = cw / 2, ch2 = ch / 2, bw = cw / 8, bh = ch / 8, nb = bw * bh;
+	// Source planes (s*) are written by the CPU then read by the GPU: keep them
+	// write-combined. Everything the CPU reads back (levels l*, cbf c*, recon r*)
+	// is allocated cached so those reads run at cache speed, not ~100 MB/s WC.
 	sY = vkc.make_buffer((size_t)cw * ch * 4);
-	rY = vkc.make_buffer((size_t)cw * ch * 4);
-	lY = vkc.make_buffer((size_t)nb * 64 * 4);
-	cY = vkc.make_buffer((size_t)nb * 4);
-	for (auto * s: {&sCb, &sCr, &rCb, &rCr})
+	rY = vkc.make_buffer((size_t)cw * ch * 4, /*cached=*/true);
+	lY = vkc.make_buffer((size_t)nb * 64 * 4, /*cached=*/true);
+	cY = vkc.make_buffer((size_t)nb * 4, /*cached=*/true);
+	for (auto * s: {&sCb, &sCr})
 		*s = vkc.make_buffer((size_t)cw2 * ch2 * 4);
+	for (auto * s: {&rCb, &rCr})
+		*s = vkc.make_buffer((size_t)cw2 * ch2 * 4, /*cached=*/true);
 	for (auto * s: {&lCb, &lCr})
-		*s = vkc.make_buffer((size_t)nb * 16 * 4);
+		*s = vkc.make_buffer((size_t)nb * 16 * 4, /*cached=*/true);
 	for (auto * s: {&cCb, &cCr})
-		*s = vkc.make_buffer((size_t)nb * 4);
+		*s = vkc.make_buffer((size_t)nb * 4, /*cached=*/true);
 	alloc_cw = cw;
 	alloc_ch = ch;
 }
@@ -111,19 +117,28 @@ void reconstructor::reconstruct(const hevc_config & cfg,
                                 block_syntax & bs,
                                 uint8_t * recY, uint8_t * recCb, uint8_t * recCr)
 {
+	using clk = std::chrono::steady_clock;
+	auto us = [](clk::time_point a, clk::time_point b) {
+		return std::chrono::duration<double, std::micro>(b - a).count();
+	};
+
 	const int cw = cfg.coded_width(), ch = cfg.coded_height();
 	const int cw2 = cw / 2, ch2 = ch / 2, bw = cw / 8, bh = ch / 8, nb = bw * bh;
 	ensure_buffers(cw, ch);
 
+	auto t0 = clk::now();
 	std::memcpy(sY.ptr, srcY, (size_t)cw * ch * 4);
 	std::memcpy(sCb.ptr, srcCb, (size_t)cw2 * ch2 * 4);
 	std::memcpy(sCr.ptr, srcCr, (size_t)cw2 * ch2 * 4);
 
+	auto t1 = clk::now();
 	vkc.run_wavefront(pl, {&sY, &rY, &lY, &cY}, wavefront_steps(cw, ch, cfg.qp, bw, bh));
+	auto t2 = clk::now();
 	const int qc = chroma_qp(cfg.qp);
 	auto chroma_steps = wavefront_steps(cw2, ch2, qc, bw, bh);
 	vkc.run_wavefront(pc, {&sCb, &rCb, &lCb, &cCb}, chroma_steps);
 	vkc.run_wavefront(pc, {&sCr, &rCr, &lCr, &cCr}, chroma_steps);
+	auto t3 = clk::now();
 
 	bs.mode.assign(nb, 1); // DC
 	bs.cbf_luma.resize(nb);
@@ -154,6 +169,9 @@ void reconstructor::reconstruct(const hevc_config & cfg,
 	copy_rec(recY, rY, (size_t)cw * ch);
 	copy_rec(recCb, rCb, (size_t)cw2 * ch2);
 	copy_rec(recCr, rCr, (size_t)cw2 * ch2);
+	auto t4 = clk::now();
+
+	last_timings = {us(t0, t1), us(t1, t2), us(t2, t3), us(t3, t4)};
 }
 
 } // namespace wivrn::h267::gpu

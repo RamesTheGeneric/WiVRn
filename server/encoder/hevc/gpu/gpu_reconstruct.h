@@ -46,6 +46,16 @@ class reconstructor
 	void ensure_buffers(int cw, int ch);
 
 public:
+	// Wall-clock breakdown of the last reconstruct() call, in microseconds.
+	struct timings
+	{
+		double upload_us = 0;   // memcpy source planes into host-visible GPU buffers
+		double luma_us = 0;     // luma wavefront submit + wait
+		double chroma_us = 0;   // Cb + Cr wavefronts submit + wait
+		double readback_us = 0; // copy levels/cbf/recon back out
+	};
+	timings last_timings{};
+
 	// WiVRn: use an existing device and the embedded SPIR-V of the two shaders.
 	void init_adopt(VkPhysicalDevice phys, VkDevice dev, VkQueue queue, uint32_t qfam,
 	                const uint32_t * luma_spv, size_t luma_words,

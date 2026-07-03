@@ -63,6 +63,16 @@ class video_encoder_h2_67 : public video_encoder
 	std::vector<int32_t> src_y, src_cb, src_cr;
 	h267::block_syntax bs;
 
+	// Rolling per-stage profile, averaged and logged every prof_window frames.
+	struct profile
+	{
+		double build = 0, recon = 0, cabac = 0;    // encode() stages (us)
+		double up = 0, luma = 0, chroma = 0, rb = 0; // recon sub-stages (us)
+		double bytes = 0;                            // coded slice size
+		uint32_t n = 0;
+	} prof;
+	static constexpr uint32_t prof_window = 60;
+
 public:
 	video_encoder_h2_67(wivrn::vk_bundle & vk, const encoder_settings & settings, uint8_t stream_idx);
 

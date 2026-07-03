@@ -23,6 +23,7 @@
 #include "utils/wivrn_vk_bundle.h"
 #include "wivrn-server_shaders.h" // ::shaders (embedded SPIR-V)
 
+#include <chrono>
 #include <format>
 #include <memory>
 #include <span>
@@ -188,6 +189,12 @@ std::optional<video_encoder::data> video_encoder_h2_67::encode(uint8_t slot, uin
 	const uint8_t * luma = reinterpret_cast<const uint8_t *>(in[slot].luma.map());
 	const uint8_t * chroma = reinterpret_cast<const uint8_t *>(in[slot].chroma.map());
 
+	using clk = std::chrono::steady_clock;
+	auto us = [](clk::time_point a, clk::time_point b) {
+		return std::chrono::duration<double, std::micro>(b - a).count();
+	};
+	auto t_build0 = clk::now();
+
 	// Build the CTB-aligned coded-size source planes (int), replicating edge
 	// samples into the padding, which the conformance window crops out.
 	const int cw = cfg.coded_width(), ch = cfg.coded_height();
@@ -209,6 +216,7 @@ std::optional<video_encoder::data> video_encoder_h2_67::encode(uint8_t slot, uin
 		}
 	}
 
+	auto t_recon0 = clk::now();
 	// GPU reconstruction wavefront -> per-CU levels/cbf. The shared queue is
 	// mutex-protected; the reconstructor submits and waits on it.
 	{
@@ -216,8 +224,10 @@ std::optional<video_encoder::data> video_encoder_h2_67::encode(uint8_t slot, uin
 		recon.reconstruct(cfg, src_y.data(), src_cb.data(), src_cr.data(), bs);
 	}
 
+	auto t_cabac0 = clk::now();
 	// CPU entropy coding from the level buffers.
 	auto slice = h267::encode_slice_from_syntax(cfg, bs);
+	auto t_cabac1 = clk::now();
 
 	auto frame = std::make_shared<std::vector<uint8_t>>();
 	frame->reserve(parameter_sets.size() + slice.size());
@@ -225,6 +235,28 @@ std::optional<video_encoder::data> video_encoder_h2_67::encode(uint8_t slot, uin
 	frame->insert(frame->end(), slice.begin(), slice.end());
 
 	// Note: the base class writes the returned span to WIVRN_DUMP_VIDEO in SendData().
+
+	// Rolling per-stage profile.
+	const auto & rt = recon.last_timings;
+	prof.build += us(t_build0, t_recon0);
+	prof.recon += us(t_recon0, t_cabac0);
+	prof.cabac += us(t_cabac0, t_cabac1);
+	prof.up += rt.upload_us;
+	prof.luma += rt.luma_us;
+	prof.chroma += rt.chroma_us;
+	prof.rb += rt.readback_us;
+	prof.bytes += (double)slice.size();
+	// Opt-in per-stage profiling: set WIVRN_H267_PROFILE=1 to log stage averages.
+	static const bool profile_enabled = std::getenv("WIVRN_H267_PROFILE") != nullptr;
+	if (profile_enabled && ++prof.n >= prof_window)
+	{
+		const double n = prof.n;
+		U_LOG_W("h2-67[%u] %.0fx%u avg/frame: build=%.0fus recon=%.0fus (up=%.0f luma=%.0f chroma=%.0f rb=%.0f) cabac=%.0fus | total=%.2fms slice=%.0fKB",
+		        stream_idx, (double)extent.width, extent.height,
+		        prof.build / n, prof.recon / n, prof.up / n, prof.luma / n, prof.chroma / n, prof.rb / n,
+		        prof.cabac / n, (prof.build + prof.recon + prof.cabac) / n / 1000.0, prof.bytes / n / 1024.0);
+		prof = {};
+	}
 
 	(void)frame_index;
 	return data{
