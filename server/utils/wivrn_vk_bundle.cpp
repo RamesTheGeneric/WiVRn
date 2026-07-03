@@ -337,7 +337,7 @@ wivrn::vk_bundle::vk_bundle() :
 #endif
 
 		// Enable features
-		auto [phys_feat, phys_feat12, phys_feat13] = physical_device.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan12Features, vk::PhysicalDeviceVulkan13Features>();
+		auto [phys_feat, phys_feat11, phys_feat12, phys_feat13] = physical_device.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features, vk::PhysicalDeviceVulkan12Features, vk::PhysicalDeviceVulkan13Features>();
 
 		std::get<vk::PhysicalDeviceVulkan12Features>(feat).descriptorBindingPartiallyBound = phys_feat12.descriptorBindingPartiallyBound;
 		std::get<vk::PhysicalDeviceVulkan12Features>(feat).timelineSemaphore = phys_feat12.timelineSemaphore;
@@ -345,6 +345,9 @@ wivrn::vk_bundle::vk_bundle() :
 		// scoreboard reconstruction (cross-workgroup atomic acquire/release).
 		std::get<vk::PhysicalDeviceVulkan12Features>(feat).vulkanMemoryModel = phys_feat12.vulkanMemoryModel;
 		std::get<vk::PhysicalDeviceVulkan12Features>(feat).vulkanMemoryModelDeviceScope = phys_feat12.vulkanMemoryModelDeviceScope;
+		// 16-bit level buffers in the H.264 encoder's recon + CAVLC-emit shaders.
+		std::get<vk::PhysicalDeviceVulkan11Features>(feat).storageBuffer16BitAccess = phys_feat11.storageBuffer16BitAccess;
+		std::get<vk::PhysicalDeviceFeatures2>(feat).features.shaderInt16 = phys_feat.features.shaderInt16;
 		std::get<vk::PhysicalDeviceVulkan13Features>(feat).synchronization2 = phys_feat13.synchronization2;
 
 		if (not phys_feat13.synchronization2)

@@ -102,6 +102,7 @@ struct vk_bundle
 #ifdef VK_KHR_unified_image_layouts
 	        vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR,
 #endif
+	        vk::PhysicalDeviceVulkan11Features,
 	        vk::PhysicalDeviceVulkan12Features,
 	        vk::PhysicalDeviceVulkan13Features>
 	        feat{};

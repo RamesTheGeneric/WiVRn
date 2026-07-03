@@ -81,10 +81,10 @@ void encoder::ensure_buffers(const h264_config & cfg, int ew, int eh)
 	rY = vkc.make_buffer((size_t)cw * ch * 4, G);
 	rCb = vkc.make_buffer((size_t)cw2 * ch2 * 4, G);
 	rCr = vkc.make_buffer((size_t)cw2 * ch2 * 4, G);
-	lDC = vkc.make_buffer((size_t)nmb * 16 * 4, G);
-	lAC = vkc.make_buffer((size_t)nmb * 256 * 4, G);
-	cDC = vkc.make_buffer((size_t)nmb * 8 * 4, G);
-	cAC = vkc.make_buffer((size_t)nmb * 128 * 4, G);
+	lDC = vkc.make_buffer((size_t)nmb * 16 * 2, G);  // int16 levels
+	lAC = vkc.make_buffer((size_t)nmb * 256 * 2, G); // int16 levels
+	cDC = vkc.make_buffer((size_t)nmb * 8 * 2, G);   // int16 levels
+	cAC = vkc.make_buffer((size_t)nmb * 128 * 2, G); // int16 levels
 	nnzL = vkc.make_buffer((size_t)(cw / 4) * (ch / 4) * 4, G);
 	nnzC = vkc.make_buffer((size_t)2 * (cw / 8) * (ch / 8) * 4, G);
 	scratch = vkc.make_buffer((size_t)nmb * stride_words * 4, G);

@@ -1,5 +1,8 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
+// Level buffers are int16 (see h264_recon_dc.comp): halves the read traffic here.
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 // Parallel CAVLC emit (PyroWave-style, intra-MB parallel): one WORKGROUP of 32
 // lanes per macroblock. An MB's bitstream is a fixed concatenation of up to 28
 // independent "segments" -- the MB header, the luma DC block, 16 luma AC blocks,
@@ -15,10 +18,10 @@
 // cannot diverge.
 layout(local_size_x = 32) in;
 
-layout(set = 0, binding = 0, std430) readonly buffer LDC { int v[]; } ldc;   // [nmb*16]
-layout(set = 0, binding = 1, std430) readonly buffer LAC { int v[]; } lac;   // [nmb*256]
-layout(set = 0, binding = 2, std430) readonly buffer CDC { int v[]; } cdc;   // [nmb*8]
-layout(set = 0, binding = 3, std430) readonly buffer CAC { int v[]; } cac;   // [nmb*128]
+layout(set = 0, binding = 0, std430) readonly buffer LDC { int16_t v[]; } ldc;   // [nmb*16]
+layout(set = 0, binding = 1, std430) readonly buffer LAC { int16_t v[]; } lac;   // [nmb*256]
+layout(set = 0, binding = 2, std430) readonly buffer CDC { int16_t v[]; } cdc;   // [nmb*8]
+layout(set = 0, binding = 3, std430) readonly buffer CAC { int16_t v[]; } cac;   // [nmb*128]
 layout(set = 0, binding = 4, std430) readonly buffer NNZL { uint v[]; } nnzL; // global luma 4x4 grid
 layout(set = 0, binding = 5, std430) readonly buffer NNZC { uint v[]; } nnzC; // global chroma 4x4 grid [2*cgw*cgh]
 layout(set = 0, binding = 6, std430) buffer Scratch { uint v[]; } scratch;    // [nmb*stride_words]
@@ -95,10 +98,10 @@ void write_level(int level_code, int sl)
 int g_which; uint g_base; // base index into the chosen buffer
 int lev(int scanRaster)
 {
-	if (g_which == 0) return ldc.v[g_base + uint(scanRaster)];
-	if (g_which == 1) return lac.v[g_base + uint(scanRaster)];
-	if (g_which == 2) return cdc.v[g_base + uint(scanRaster)];
-	return cac.v[g_base + uint(scanRaster)];
+	if (g_which == 0) return int(ldc.v[g_base + uint(scanRaster)]);
+	if (g_which == 1) return int(lac.v[g_base + uint(scanRaster)]);
+	if (g_which == 2) return int(cdc.v[g_base + uint(scanRaster)]);
+	return int(cac.v[g_base + uint(scanRaster)]);
 }
 
 void residual_block(int count, int nC, bool chroma_dc, int scankind)
@@ -230,14 +233,14 @@ void main()
 		int zi = int(seg) - 2;
 		int bx = zblk_bx[zi], by = zblk_by[zi];
 		uint bb = mb * 256u + uint(by * 4 + bx) * 16u;
-		for (int k = 1; k < 16; ++k) if (lac.v[bb + uint(k)] != 0) nz = 1u;
+		for (int k = 1; k < 16; ++k) if (int(lac.v[bb + uint(k)]) != 0) nz = 1u;
 	} else if (seg >= 18u && seg <= 19u) {   // chroma DC (Cb, Cr)
 		uint bb = mb * 8u + uint(int(seg) - 18) * 4u;
-		for (int k = 0; k < 4; ++k) if (cdc.v[bb + uint(k)] != 0) nz = 1u;
+		for (int k = 0; k < 4; ++k) if (int(cdc.v[bb + uint(k)]) != 0) nz = 1u;
 	} else if (seg >= 20u && seg <= 27u) {   // chroma AC
 		int idx = int(seg) - 20;
 		uint bb = mb * 128u + uint(idx / 4) * 64u + uint(idx % 4) * 16u;
-		for (int k = 1; k < 16; ++k) if (cac.v[bb + uint(k)] != 0) nz = 1u;
+		for (int k = 1; k < 16; ++k) if (int(cac.v[bb + uint(k)]) != 0) nz = 1u;
 	}
 	hnz[seg] = nz;
 	barrier();

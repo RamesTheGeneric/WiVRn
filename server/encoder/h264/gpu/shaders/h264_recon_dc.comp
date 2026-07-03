@@ -14,6 +14,11 @@
 // before edge, unlike legacy `coherent` + memoryBarrierBuffer() (which is
 // underspecified for cross-workgroup ordering and raced under contention).
 #extension GL_KHR_memory_scope_semantics : require
+// int16 level buffers: quantized H.264 levels fit in int16 for every qp (worst
+// case: luma AC |lvl|<=3672, luma DC <=6528, chroma DC <=3264 at qp=0; all <32767),
+// halving the level-buffer write traffic here and read traffic in the emit stage.
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 layout(local_size_x = 32) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer SrcY { uint v[]; } srcY;   // packed u8 luma (ew*eh)
@@ -23,10 +28,10 @@ layout(set = 0, binding = 1, std430) readonly buffer SrcC { uint v[]; } srcC;   
 layout(set = 0, binding = 2, std430) coherent buffer RecY { int v[]; } recY;    // coded cw*ch
 layout(set = 0, binding = 3, std430) coherent buffer RecCb { int v[]; } recCb;
 layout(set = 0, binding = 4, std430) coherent buffer RecCr { int v[]; } recCr;
-layout(set = 0, binding = 5, std430) writeonly buffer OutLDC { int v[]; } outLDC;   // [nmb*16]
-layout(set = 0, binding = 6, std430) buffer OutLAC { int v[]; } outLAC;   // [nmb*16*16] (recon reads back)
-layout(set = 0, binding = 7, std430) writeonly buffer OutCDC { int v[]; } outCDC;   // [nmb*2*4]
-layout(set = 0, binding = 8, std430) buffer OutCAC { int v[]; } outCAC;   // [nmb*2*4*16] (recon reads back)
+layout(set = 0, binding = 5, std430) writeonly buffer OutLDC { int16_t v[]; } outLDC;   // [nmb*16]
+layout(set = 0, binding = 6, std430) writeonly buffer OutLAC { int16_t v[]; } outLAC;   // [nmb*16*16]
+layout(set = 0, binding = 7, std430) writeonly buffer OutCDC { int16_t v[]; } outCDC;   // [nmb*2*4]
+layout(set = 0, binding = 8, std430) writeonly buffer OutCAC { int16_t v[]; } outCAC;   // [nmb*2*4*16]
 layout(set = 0, binding = 9, std430) writeonly buffer OutNL { uint v[]; } outNL;    // global luma 4x4 nnz grid [lgw*lgh]
 layout(set = 0, binding = 10, std430) writeonly buffer OutNC { uint v[]; } outNC;   // global chroma 4x4 nnz grid [2*cgw*cgh]
 // Scoreboard state: MB raster indices in anti-diagonal order, an atomic claim
@@ -201,6 +206,10 @@ void main()
 	barrier();
 
 	// ---- per-block forward transform + quant (threads 0..23) ----
+	// carry_lv: this lane keeps its 15 AC levels in registers from the transform
+	// phase to the reconstruction phase (same lane owns the same 4x4 block in both),
+	// so recon reads them from VGPRs instead of re-reading outLAC/outCAC from memory.
+	int carry_lv[16]; carry_lv[0] = 0;
 	if (t < 16u) {
 		int bx = int(t & 3u), by = int(t >> 2);
 		int blk[16];
@@ -209,11 +218,12 @@ void main()
 		fdct4(blk);
 		dcRawL[by*4+bx] = blk[0];
 		uint acbase = nmb_idx * 256u + uint(by*4+bx) * 16u;
-		outLAC.v[acbase + 0u] = 0;
+		outLAC.v[acbase + 0u] = int16_t(0);
 		uint nz = 0u;
 		for (int k = 1; k < 16; ++k) {
 			int lv = quantAC(blk[k], k/4, k%4, pc.qp);
-			outLAC.v[acbase + uint(k)] = lv;
+			carry_lv[k] = lv;
+			outLAC.v[acbase + uint(k)] = int16_t(lv);
 			if (lv != 0) ++nz;
 		}
 		uint lgw = pc.cw / 4u;
@@ -229,11 +239,12 @@ void main()
 		fdct4(blk);
 		if (comp == 0) dcRawCb[(sby/4)*2+(sbx/4)] = blk[0]; else dcRawCr[(sby/4)*2+(sbx/4)] = blk[0];
 		uint acbase = nmb_idx * 128u + uint(comp) * 64u + uint(sb) * 16u;
-		outCAC.v[acbase + 0u] = 0;
+		outCAC.v[acbase + 0u] = int16_t(0);
 		uint nz = 0u;
 		for (int k = 1; k < 16; ++k) {
 			int lv = quantAC(blk[k], k/4, k%4, pc.qpc);
-			outCAC.v[acbase + uint(k)] = lv;
+			carry_lv[k] = lv;
+			outCAC.v[acbase + uint(k)] = int16_t(lv);
 			if (lv != 0) ++nz;
 		}
 		uint cgw = pc.cw / 8u, cgh = pc.ch / 8u;
@@ -257,7 +268,7 @@ void main()
 			had[0*4+j]=(s0+s1+1)>>1; had[1*4+j]=(s3+s2+1)>>1; had[2*4+j]=(s0-s1+1)>>1; had[3*4+j]=(s3-s2+1)>>1;
 		}
 		int lv[16];
-		for (int i = 0; i < 16; ++i) { lv[i] = quantDC(had[i], pc.qp); outLDC.v[nmb_idx*16u+uint(i)] = lv[i]; }
+		for (int i = 0; i < 16; ++i) { lv[i] = quantDC(had[i], pc.qp); outLDC.v[nmb_idx*16u+uint(i)] = int16_t(lv[i]); }
 		// inverse luma DC -> dcYL
 		int f[16];
 		for (int i=0;i<4;++i){int x0=lv[i*4+0],x1=lv[i*4+1],x2=lv[i*4+2],x3=lv[i*4+3];
@@ -279,7 +290,7 @@ void main()
 		int h0=c0+c1+c2+c3, h1=c0-c1+c2-c3, h2=c0+c1-c2-c3, h3=c0-c1-c2+c3;
 		int L0=quantDC(h0,pc.qpc),L1=quantDC(h1,pc.qpc),L2=quantDC(h2,pc.qpc),L3=quantDC(h3,pc.qpc);
 		uint cbase = nmb_idx*8u + uint(comp)*4u;
-		outCDC.v[cbase+0u]=L0; outCDC.v[cbase+1u]=L1; outCDC.v[cbase+2u]=L2; outCDC.v[cbase+3u]=L3;
+		outCDC.v[cbase+0u]=int16_t(L0); outCDC.v[cbase+1u]=int16_t(L1); outCDC.v[cbase+2u]=int16_t(L2); outCDC.v[cbase+3u]=int16_t(L3);
 		int fa=L0+L1+L2+L3, fb=L0-L1+L2-L3, fc=L0+L1-L2-L3, fd=L0-L1-L2+L3;
 		int lsc = 16 * VS[pc.qpc % 6][0];
 		int d0=((fa*lsc)<<(pc.qpc/6))>>5, d1=((fb*lsc)<<(pc.qpc/6))>>5, d2=((fc*lsc)<<(pc.qpc/6))>>5, d3=((fd*lsc)<<(pc.qpc/6))>>5;
@@ -288,14 +299,11 @@ void main()
 	}
 	barrier();
 
-	// ---- reconstruction ----
+	// ---- reconstruction (AC levels come from carry_lv, not a memory re-read) ----
 	if (t < 16u) {
 		int bx = int(t & 3u), by = int(t >> 2);
-		int lv[16]; lv[0]=0;
-		uint acbase = nmb_idx * 256u + uint(by*4+bx) * 16u;
-		for (int k = 1; k < 16; ++k) lv[k] = outLAC.v[acbase + uint(k)];
 		int res[16];
-		idct4(lv, pc.qp, dcYL[by*4+bx], res);
+		idct4(carry_lv, pc.qp, dcYL[by*4+bx], res);
 		for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c)
 			recY.v[(py + by*4 + r) * cw + (px + bx*4 + c)] = clippix(predY + res[r*4+c]);
 	} else if (t < 24u) {
@@ -304,11 +312,8 @@ void main()
 		int sbx = (sb & 1) * 4, sby = (sb >> 1) * 4;
 		int pcv = comp == 0 ? predCb[sb] : predCr[sb];
 		int dcov = comp == 0 ? dcYCb[(sby/4)*2+(sbx/4)] : dcYCr[(sby/4)*2+(sbx/4)];
-		int lv[16]; lv[0]=0;
-		uint acbase = nmb_idx * 128u + uint(comp) * 64u + uint(sb) * 16u;
-		for (int k = 1; k < 16; ++k) lv[k] = outCAC.v[acbase + uint(k)];
 		int res[16];
-		idct4(lv, pc.qpc, dcov, res);
+		idct4(carry_lv, pc.qpc, dcov, res);
 		for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) {
 			int val = clippix(pcv + res[r*4+c]);
 			if (comp == 0) recCb.v[(cpy + sby + r) * cw2 + (cpx + sbx + c)] = val;

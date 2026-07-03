@@ -64,10 +64,10 @@ int main(int argc, char ** argv)
 		auto bRY = vk.make_buffer((size_t)cw * ch * 4, true);
 		auto bRCb = vk.make_buffer((size_t)cw2 * ch2 * 4, true);
 		auto bRCr = vk.make_buffer((size_t)cw2 * ch2 * 4, true);
-		auto bLDC = vk.make_buffer((size_t)nmb * 16 * 4, true);
-		auto bLAC = vk.make_buffer((size_t)nmb * 256 * 4, true);
-		auto bCDC = vk.make_buffer((size_t)nmb * 8 * 4, true);
-		auto bCAC = vk.make_buffer((size_t)nmb * 128 * 4, true);
+		auto bLDC = vk.make_buffer((size_t)nmb * 16 * 2, true);  // int16 levels
+		auto bLAC = vk.make_buffer((size_t)nmb * 256 * 2, true); // int16 levels
+		auto bCDC = vk.make_buffer((size_t)nmb * 8 * 2, true);   // int16 levels
+		auto bCAC = vk.make_buffer((size_t)nmb * 128 * 2, true); // int16 levels
 		auto bNL = vk.make_buffer((size_t)(cw / 4) * (ch / 4) * 4, true);
 		auto bNC = vk.make_buffer((size_t)2 * (cw / 8) * (ch / 8) * 4, true);
 
