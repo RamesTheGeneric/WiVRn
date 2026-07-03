@@ -133,7 +133,8 @@ void main()
 	bool availL = availL_s, availT = availT_s;
 	uint nmb_idx = mby * pc.mbw + mbx;
 
-	// ---- predictions (thread 0) ----
+	// ---- predictions (parallel: thread 0 = luma DC, threads 1..8 = the 8 chroma
+	// sub-block DCs, one lane each) ----
 	if (t == 0u) {
 		int sT = 0, sL = 0;
 		for (int i = 0; i < 16; ++i) {
@@ -144,30 +145,28 @@ void main()
 		else if (availT) predY = (sT + 8) >> 4;
 		else if (availL) predY = (sL + 8) >> 4;
 		else predY = 128;
-		// chroma per sub-block
-		for (int comp = 0; comp < 2; ++comp) {
-			for (int sb = 0; sb < 4; ++sb) {
-				int sbx = (sb & 1) * 4, sby = (sb >> 1) * 4;
-				int cT = 0, cL = 0;
-				for (int i = 0; i < 4; ++i) {
-					if (availT) cT += (comp == 0 ? recCb.v[(cpy - 1) * cw2 + (cpx + sbx + i)] : recCr.v[(cpy - 1) * cw2 + (cpx + sbx + i)]);
-					if (availL) cL += (comp == 0 ? recCb.v[(cpy + sby + i) * cw2 + (cpx - 1)] : recCr.v[(cpy + sby + i) * cw2 + (cpx - 1)]);
-				}
-				int pcv;
-				bool diag = (sbx == 0 && sby == 0) || (sbx > 0 && sby > 0);
-				if (diag) {
-					if (availT && availL) pcv = (cT + cL + 4) >> 3;
-					else if (availT) pcv = (cT + 2) >> 2;
-					else if (availL) pcv = (cL + 2) >> 2;
-					else pcv = 128;
-				} else if (sbx > 0) {
-					if (availT) pcv = (cT + 2) >> 2; else if (availL) pcv = (cL + 2) >> 2; else pcv = 128;
-				} else {
-					if (availL) pcv = (cL + 2) >> 2; else if (availT) pcv = (cT + 2) >> 2; else pcv = 128;
-				}
-				if (comp == 0) predCb[sb] = pcv; else predCr[sb] = pcv;
-			}
+	} else if (t <= 8u) {
+		int comp = int(t - 1u) / 4;
+		int sb = int(t - 1u) % 4;
+		int sbx = (sb & 1) * 4, sby = (sb >> 1) * 4;
+		int cT = 0, cL = 0;
+		for (int i = 0; i < 4; ++i) {
+			if (availT) cT += (comp == 0 ? recCb.v[(cpy - 1) * cw2 + (cpx + sbx + i)] : recCr.v[(cpy - 1) * cw2 + (cpx + sbx + i)]);
+			if (availL) cL += (comp == 0 ? recCb.v[(cpy + sby + i) * cw2 + (cpx - 1)] : recCr.v[(cpy + sby + i) * cw2 + (cpx - 1)]);
 		}
+		int pcv;
+		bool diag = (sbx == 0 && sby == 0) || (sbx > 0 && sby > 0);
+		if (diag) {
+			if (availT && availL) pcv = (cT + cL + 4) >> 3;
+			else if (availT) pcv = (cT + 2) >> 2;
+			else if (availL) pcv = (cL + 2) >> 2;
+			else pcv = 128;
+		} else if (sbx > 0) {
+			if (availT) pcv = (cT + 2) >> 2; else if (availL) pcv = (cL + 2) >> 2; else pcv = 128;
+		} else {
+			if (availL) pcv = (cL + 2) >> 2; else if (availT) pcv = (cT + 2) >> 2; else pcv = 128;
+		}
+		if (comp == 0) predCb[sb] = pcv; else predCr[sb] = pcv;
 	}
 	barrier();
 
@@ -241,22 +240,21 @@ void main()
 			if (pc.qp >= 36) dcYL[i] = (g[i]*ls) << (pc.qp/6 - 6);
 			else dcYL[i] = (g[i]*ls + (1 << (5 - pc.qp/6))) >> (6 - pc.qp/6);
 		}
-		// chroma 2x2 Hadamard per component
-		for (int comp = 0; comp < 2; ++comp) {
-			int c0,c1,c2,c3;
-			if (comp==0){c0=dcRawCb[0];c1=dcRawCb[1];c2=dcRawCb[2];c3=dcRawCb[3];}
-			else {c0=dcRawCr[0];c1=dcRawCr[1];c2=dcRawCr[2];c3=dcRawCr[3];}
-			int h0=c0+c1+c2+c3, h1=c0-c1+c2-c3, h2=c0+c1-c2-c3, h3=c0-c1-c2+c3;
-			int L0=quantDC(h0,pc.qpc),L1=quantDC(h1,pc.qpc),L2=quantDC(h2,pc.qpc),L3=quantDC(h3,pc.qpc);
-			uint cbase = nmb_idx*8u + uint(comp)*4u;
-			outCDC.v[cbase+0u]=L0; outCDC.v[cbase+1u]=L1; outCDC.v[cbase+2u]=L2; outCDC.v[cbase+3u]=L3;
-			// inverse 2x2 Hadamard + scale
-			int fa=L0+L1+L2+L3, fb=L0-L1+L2-L3, fc=L0+L1-L2-L3, fd=L0-L1-L2+L3;
-			int lsc = 16 * VS[pc.qpc % 6][0];
-			int d0=((fa*lsc)<<(pc.qpc/6))>>5, d1=((fb*lsc)<<(pc.qpc/6))>>5, d2=((fc*lsc)<<(pc.qpc/6))>>5, d3=((fd*lsc)<<(pc.qpc/6))>>5;
-			if (comp==0){dcYCb[0]=d0;dcYCb[1]=d1;dcYCb[2]=d2;dcYCb[3]=d3;}
-			else {dcYCr[0]=d0;dcYCr[1]=d1;dcYCr[2]=d2;dcYCr[3]=d3;}
-		}
+	} else if (t == 1u || t == 2u) {
+		// chroma 2x2 Hadamard: t==1 -> Cb, t==2 -> Cr (one lane each)
+		int comp = int(t) - 1;
+		int c0,c1,c2,c3;
+		if (comp==0){c0=dcRawCb[0];c1=dcRawCb[1];c2=dcRawCb[2];c3=dcRawCb[3];}
+		else {c0=dcRawCr[0];c1=dcRawCr[1];c2=dcRawCr[2];c3=dcRawCr[3];}
+		int h0=c0+c1+c2+c3, h1=c0-c1+c2-c3, h2=c0+c1-c2-c3, h3=c0-c1-c2+c3;
+		int L0=quantDC(h0,pc.qpc),L1=quantDC(h1,pc.qpc),L2=quantDC(h2,pc.qpc),L3=quantDC(h3,pc.qpc);
+		uint cbase = nmb_idx*8u + uint(comp)*4u;
+		outCDC.v[cbase+0u]=L0; outCDC.v[cbase+1u]=L1; outCDC.v[cbase+2u]=L2; outCDC.v[cbase+3u]=L3;
+		int fa=L0+L1+L2+L3, fb=L0-L1+L2-L3, fc=L0+L1-L2-L3, fd=L0-L1-L2+L3;
+		int lsc = 16 * VS[pc.qpc % 6][0];
+		int d0=((fa*lsc)<<(pc.qpc/6))>>5, d1=((fb*lsc)<<(pc.qpc/6))>>5, d2=((fc*lsc)<<(pc.qpc/6))>>5, d3=((fd*lsc)<<(pc.qpc/6))>>5;
+		if (comp==0){dcYCb[0]=d0;dcYCb[1]=d1;dcYCb[2]=d2;dcYCb[3]=d3;}
+		else {dcYCr[0]=d0;dcYCr[1]=d1;dcYCr[2]=d2;dcYCr[3]=d3;}
 	}
 	barrier();
 
