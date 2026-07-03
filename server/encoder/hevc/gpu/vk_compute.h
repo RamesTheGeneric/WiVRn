@@ -53,6 +53,8 @@ public:
 	uint32_t host_mem_type = ~0u;      // HOST_VISIBLE|COHERENT — fast CPU writes (uploads)
 	uint32_t host_read_mem_type = ~0u; // + HOST_CACHED — fast CPU reads (readback)
 	bool owns_device = false;          // true when init() created the device/instance
+	float timestamp_period = 1.0f;     // ns per timestamp tick (device limit); for GPU-side profiling
+	bool profile_gpu = false;          // when set, begin_batch attaches a timestamp query pool
 
 	struct buffer
 	{
@@ -122,6 +124,11 @@ public:
 		f12.storageBuffer8BitAccess = VK_TRUE;
 		f12.uniformAndStorageBuffer8BitAccess = VK_TRUE;
 		f12.shaderInt8 = VK_TRUE;
+		// Vulkan memory model with device scope: lets shaders use explicit
+		// atomic acquire/release (GL_KHR_memory_scope_semantics) for correct
+		// cross-workgroup synchronisation (scoreboard reconstruction).
+		f12.vulkanMemoryModel = VK_TRUE;
+		f12.vulkanMemoryModelDeviceScope = VK_TRUE;
 		VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
 		f2.pNext = &f12;
 		f2.features.shaderInt16 = VK_TRUE;
@@ -168,6 +175,10 @@ private:
 		pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 		pci.queueFamilyIndex = qfam;
 		vkcheck(vkCreateCommandPool(dev, &pci, nullptr, &pool), "vkCreateCommandPool");
+
+		VkPhysicalDeviceProperties props;
+		vkGetPhysicalDeviceProperties(phys, &props);
+		timestamp_period = props.limits.timestampPeriod; // ns/tick, for GPU-stage profiling
 
 		VkPhysicalDeviceMemoryProperties mp;
 		vkGetPhysicalDeviceMemoryProperties(phys, &mp);
@@ -430,6 +441,10 @@ public:
 	struct batch
 	{
 		VkCommandBuffer cmd = VK_NULL_HANDLE;
+		VkQueryPool tspool = VK_NULL_HANDLE; // optional GPU timestamps
+		uint32_t ts_count = 0;
+		static constexpr uint32_t ts_max = 16;
+		std::vector<uint64_t> ts; // filled after submit_and_wait when tspool != null
 	};
 
 private:
@@ -470,7 +485,23 @@ public:
 		VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
 		bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 		vkBeginCommandBuffer(b.cmd, &bi);
+		if (profile_gpu)
+		{
+			VkQueryPoolCreateInfo qpi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+			qpi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+			qpi.queryCount = batch::ts_max;
+			if (vkCreateQueryPool(dev, &qpi, nullptr, &b.tspool) == VK_SUCCESS)
+				vkCmdResetQueryPool(b.cmd, b.tspool, 0, batch::ts_max);
+		}
 		return b;
+	}
+
+	// Latch a GPU timestamp at this point in the batch (no-op unless profiling).
+	// Writes at BOTTOM_OF_PIPE so it reflects completion of all prior commands.
+	void record_timestamp(batch & b)
+	{
+		if (b.tspool && b.ts_count < batch::ts_max)
+			vkCmdWriteTimestamp(b.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, b.tspool, b.ts_count++);
 	}
 
 	// Zero a buffer on the GPU, then a TRANSFER->COMPUTE barrier so later dispatches see it.
@@ -540,6 +571,23 @@ public:
 		vkcheck(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX), "waitFence");
 		vkDestroyFence(dev, fence, nullptr);
 		vkFreeCommandBuffers(dev, pool, 1, &b.cmd);
+		if (b.tspool)
+		{
+			b.ts.resize(b.ts_count);
+			if (b.ts_count)
+				vkGetQueryPoolResults(dev, b.tspool, 0, b.ts_count, b.ts_count * sizeof(uint64_t),
+				                      b.ts.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+			vkDestroyQueryPool(dev, b.tspool, nullptr);
+			b.tspool = VK_NULL_HANDLE;
+		}
+	}
+
+	// Convert a (from,to) timestamp index pair to microseconds. Returns 0 if unavailable.
+	double ts_us(const batch & b, uint32_t from, uint32_t to) const
+	{
+		if (from >= b.ts.size() || to >= b.ts.size() || b.ts[to] < b.ts[from])
+			return 0.0;
+		return double(b.ts[to] - b.ts[from]) * double(timestamp_period) / 1000.0;
 	}
 };
 
