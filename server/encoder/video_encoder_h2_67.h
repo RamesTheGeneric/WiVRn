@@ -18,27 +18,29 @@
 
 #pragma once
 
+#include "hevc/cabac_pass.h"
+#include "hevc/gpu/gpu_reconstruct.h"
 #include "hevc/param_sets.h"
 #include "video_encoder.h"
 #include "vk/allocation.h"
 
 #include <array>
+#include <cstdint>
+#include <vector>
 #include <vulkan/vulkan_raii.hpp>
 
 namespace wivrn
 {
 
-// From-scratch HEVC intra encoder (Main profile, 8-bit, all-IDR). The compressed
-// bitstream is produced with our own conformance-verified encoder rather than a
-// hardware video-encode block, for machines that have GPU compute but no
-// hardware encoder. This build copies the compositor's YUV image to the host and
-// runs the CPU reference encoder; the reconstruction stage is being moved to
-// Vulkan compute (server/encoder/hevc/gpu). Bitstream is standard Main-profile
-// HEVC decodable by the existing client decoders.
-class video_encoder_hevc : public video_encoder
+// "h2-67": a from-scratch, shader-based HEVC intra encoder for machines that
+// have GPU compute but no hardware video-encode block. The per-block
+// reconstruction (intra prediction, transform, quantisation, inverse transform)
+// runs as a Vulkan compute wavefront on WiVRn's shared device; entropy coding
+// (CABAC) runs on the CPU from the reconstruction's level buffers. The output is
+// standard Main-profile HEVC decodable by the existing client decoders.
+class video_encoder_h2_67 : public video_encoder
 {
 	wivrn::vk_bundle & vk;
-	uint64_t sem_value = 0;
 	vk::raii::CommandPool cmd_pool;
 
 	struct in_t
@@ -50,14 +52,19 @@ class video_encoder_hevc : public video_encoder
 	};
 	std::array<in_t, num_slots> in;
 
-	uint32_t luma_stride;   // = extent.width
-	uint32_t chroma_stride; // bytes per chroma row = extent.width
+	uint32_t luma_stride;
+	uint32_t chroma_stride;
 
 	hevc::hevc_config cfg;
-	std::vector<uint8_t> parameter_sets; // built once (config is static)
+	std::vector<uint8_t> parameter_sets;
+
+	hevc::gpu::reconstructor recon;
+	// Reused host-side coded-size source planes and syntax across frames.
+	std::vector<int32_t> src_y, src_cb, src_cr;
+	hevc::block_syntax bs;
 
 public:
-	video_encoder_hevc(wivrn::vk_bundle & vk, const encoder_settings & settings, uint8_t stream_idx);
+	video_encoder_h2_67(wivrn::vk_bundle & vk, const encoder_settings & settings, uint8_t stream_idx);
 
 	void present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo, uint8_t slot, uint64_t frame_index) override;
 

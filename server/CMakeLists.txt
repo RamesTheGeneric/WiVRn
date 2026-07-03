@@ -112,13 +112,15 @@ if (WIVRN_BUILD_SERVER)
 			encoder/idr_handler.cpp
 			encoder/video_encoder.cpp
 			encoder/video_encoder_raw.cpp
-			encoder/video_encoder_hevc.cpp
+			encoder/video_encoder_h2_67.cpp
 			encoder/hevc/bitwriter.cpp
 			encoder/hevc/param_sets.cpp
 			encoder/hevc/cabac_reference.cpp
 			encoder/hevc/transform.cpp
 			encoder/hevc/residual_coding.cpp
 			encoder/hevc/cpu_encoder.cpp
+			encoder/hevc/cabac_pass.cpp
+			encoder/hevc/gpu/gpu_reconstruct.cpp
 
 			driver/app_pacer.cpp
 			driver/clock_offset.cpp
@@ -284,6 +286,8 @@ if (WIVRN_BUILD_SERVER)
 		SHADERS
 			"${_monado_src}/src/xrt/compositor/shaders/layer.comp"
 			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/foveation.comp"
+			"${CMAKE_CURRENT_SOURCE_DIR}/encoder/hevc/gpu/shaders/hevc_recon_dc_luma.comp"
+			"${CMAKE_CURRENT_SOURCE_DIR}/encoder/hevc/gpu/shaders/hevc_recon_dc_chroma.comp"
 		)
 
 	target_compile_definitions(wivrn-server PRIVATE JSON_DIAGNOSTICS=1)

@@ -16,12 +16,12 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#include "video_encoder_hevc.h"
+#include "video_encoder_h2_67.h"
 
 #include "encoder_settings.h"
-#include "hevc/cpu_encoder.h"
 #include "util/u_logging.h"
 #include "utils/wivrn_vk_bundle.h"
+#include "wivrn-server_shaders.h" // ::shaders (embedded SPIR-V)
 
 #include <format>
 #include <memory>
@@ -39,14 +39,13 @@ vk::raii::CommandPool make_cmd_pool(wivrn::vk_bundle & vk, uint8_t stream_idx)
 	        .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer | vk::CommandPoolCreateFlagBits::eTransient,
 	        .queueFamilyIndex = vk.transfer_queue ? vk.transfer_queue.family_index : vk.queue.family_index,
 	});
-	vk.name(res, std::format("hevc encoder {} command pool", stream_idx));
+	vk.name(res, std::format("h2-67 encoder {} command pool", stream_idx));
 	return res;
 }
 
 int parse_qp(const encoder_settings & settings)
 {
-	auto it = settings.options.find("qp");
-	if (it != settings.options.end())
+	if (auto it = settings.options.find("qp"); it != settings.options.end())
 	{
 		try
 		{
@@ -62,7 +61,7 @@ int parse_qp(const encoder_settings & settings)
 }
 } // namespace
 
-video_encoder_hevc::video_encoder_hevc(
+video_encoder_h2_67::video_encoder_h2_67(
         wivrn::vk_bundle & vk,
         const encoder_settings & settings,
         uint8_t stream_idx) :
@@ -76,9 +75,9 @@ video_encoder_hevc::video_encoder_hevc(
         cmd_pool{make_cmd_pool(vk, stream_idx)}
 {
 	if (settings.bit_depth != 8)
-		throw std::runtime_error("hevc compute encoder only supports 8-bit encoding");
+		throw std::runtime_error("h2-67 encoder only supports 8-bit encoding");
 	if (settings.codec != h265)
-		U_LOG_W("requested hevc encoder with codec != h265");
+		U_LOG_W("requested h2-67 encoder with codec != h265");
 
 	luma_stride = extent.width;
 	chroma_stride = extent.width;
@@ -87,30 +86,46 @@ video_encoder_hevc::video_encoder_hevc(
 	cfg.height = extent.height;
 	cfg.bit_depth = 8;
 	cfg.qp = parse_qp(settings);
-	cfg.max_tb_log2_size = 3; // this encoder uses 8x8 luma / 4x4 chroma TUs
+	cfg.max_tb_log2_size = 3;
 	parameter_sets = hevc::build_parameter_sets(cfg);
+
+	// Reconstruction runs on WiVRn's shared device with the embedded shaders.
+	const auto & luma_spv = ::shaders.at("hevc_recon_dc_luma");
+	const auto & chroma_spv = ::shaders.at("hevc_recon_dc_chroma");
+	recon.init_adopt(
+	        static_cast<VkPhysicalDevice>(*vk.physical_device),
+	        static_cast<VkDevice>(*vk.device),
+	        static_cast<VkQueue>(*vk.queue.queue),
+	        vk.queue.family_index,
+	        luma_spv.data(), luma_spv.size(),
+	        chroma_spv.data(), chroma_spv.size());
+
+	const int cw = cfg.coded_width(), ch = cfg.coded_height();
+	src_y.resize((size_t)cw * ch);
+	src_cb.resize((size_t)(cw / 2) * (ch / 2));
+	src_cr.resize((size_t)(cw / 2) * (ch / 2));
 
 	auto command_buffers = vk.device.allocateCommandBuffers(
 	        {.commandPool = *cmd_pool, .commandBufferCount = num_slots});
 	for (size_t i = 0; i < num_slots; ++i)
 	{
 		in[i].cmd = std::move(command_buffers[i]);
-		vk.name(in[i].cmd, std::format("hevc {} transfer command buffer {}", stream_idx, i));
+		vk.name(in[i].cmd, std::format("h2-67 {} transfer command buffer {}", stream_idx, i));
 		in[i].fence = vk::raii::Fence(vk.device, vk::FenceCreateInfo{.flags = vk::FenceCreateFlagBits::eSignaled});
 		in[i].luma = buffer_allocation(
 		        vk.device,
 		        {.size = vk::DeviceSize(extent.width * extent.height), .usage = vk::BufferUsageFlagBits::eTransferDst},
 		        {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT, .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST},
-		        "hevc luma buffer");
+		        "h2-67 luma buffer");
 		in[i].chroma = buffer_allocation(
 		        vk.device,
 		        {.size = vk::DeviceSize(extent.width * extent.height / 2), .usage = vk::BufferUsageFlagBits::eTransferDst},
 		        {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT, .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST},
-		        "hevc chroma buffer");
+		        "h2-67 chroma buffer");
 	}
 }
 
-void video_encoder_hevc::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t slot, uint64_t)
+void video_encoder_h2_67::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t slot, uint64_t)
 {
 	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
 	{
@@ -162,7 +177,7 @@ void video_encoder_hevc::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo
 	                       *in[slot].fence);
 }
 
-std::optional<video_encoder::data> video_encoder_hevc::encode(uint8_t slot, uint64_t frame_index)
+std::optional<video_encoder::data> video_encoder_h2_67::encode(uint8_t slot, uint64_t frame_index)
 {
 	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
 	{
@@ -173,24 +188,15 @@ std::optional<video_encoder::data> video_encoder_hevc::encode(uint8_t slot, uint
 	const uint8_t * luma = reinterpret_cast<const uint8_t *>(in[slot].luma.map());
 	const uint8_t * chroma = reinterpret_cast<const uint8_t *>(in[slot].chroma.map());
 
-	// Assemble the CTB-aligned coded image, replicating edge samples into the
-	// padding (which the conformance window crops out).
+	// Build the CTB-aligned coded-size source planes (int), replicating edge
+	// samples into the padding, which the conformance window crops out.
 	const int cw = cfg.coded_width(), ch = cfg.coded_height();
 	const int ew = extent.width, eh = extent.height;
-	hevc::yuv_image img;
-	img.width = cw;
-	img.height = ch;
-	img.Y.resize((size_t)cw * ch);
-	img.Cb.resize((size_t)(cw / 2) * (ch / 2));
-	img.Cr.resize((size_t)(cw / 2) * (ch / 2));
 	for (int y = 0; y < ch; ++y)
 	{
 		const int sy = y < eh ? y : eh - 1;
 		for (int x = 0; x < cw; ++x)
-		{
-			const int sx = x < ew ? x : ew - 1;
-			img.Y[(size_t)y * cw + x] = luma[(size_t)sy * luma_stride + sx];
-		}
+			src_y[(size_t)y * cw + x] = luma[(size_t)sy * luma_stride + (x < ew ? x : ew - 1)];
 	}
 	for (int y = 0; y < ch / 2; ++y)
 	{
@@ -198,16 +204,24 @@ std::optional<video_encoder::data> video_encoder_hevc::encode(uint8_t slot, uint
 		for (int x = 0; x < cw / 2; ++x)
 		{
 			const int sx = x < ew / 2 ? x : ew / 2 - 1;
-			img.Cb[(size_t)y * (cw / 2) + x] = chroma[(size_t)sy * chroma_stride + sx * 2 + 0];
-			img.Cr[(size_t)y * (cw / 2) + x] = chroma[(size_t)sy * chroma_stride + sx * 2 + 1];
+			src_cb[(size_t)y * (cw / 2) + x] = chroma[(size_t)sy * chroma_stride + sx * 2 + 0];
+			src_cr[(size_t)y * (cw / 2) + x] = chroma[(size_t)sy * chroma_stride + sx * 2 + 1];
 		}
 	}
 
-	auto slice = hevc::encode_intra_frame(cfg, img);
+	// GPU reconstruction wavefront -> per-CU levels/cbf. The shared queue is
+	// mutex-protected; the reconstructor submits and waits on it.
+	{
+		std::unique_lock lock(vk.queue.mutex);
+		recon.reconstruct(cfg, src_y.data(), src_cb.data(), src_cr.data(), bs);
+	}
+
+	// CPU entropy coding from the level buffers.
+	auto slice = hevc::encode_slice_from_syntax(cfg, bs);
 
 	auto frame = std::make_shared<std::vector<uint8_t>>();
 	frame->reserve(parameter_sets.size() + slice.size());
-	frame->insert(frame->end(), parameter_sets.begin(), parameter_sets.end()); // VPS/SPS/PPS every IDR
+	frame->insert(frame->end(), parameter_sets.begin(), parameter_sets.end());
 	frame->insert(frame->end(), slice.begin(), slice.end());
 
 	if (video_dump.is_open())
@@ -218,7 +232,7 @@ std::optional<video_encoder::data> video_encoder_hevc::encode(uint8_t slot, uint
 	        .encoder = this,
 	        .span = std::span<uint8_t>(*frame),
 	        .mem = frame,
-	        .prefer_control = true, // all-IDR: send reliably
+	        .prefer_control = true,
 	};
 }
 

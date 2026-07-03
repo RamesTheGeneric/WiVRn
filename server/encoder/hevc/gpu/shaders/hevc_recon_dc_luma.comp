@@ -1,5 +1,4 @@
 #version 460
-#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 // Luma DC reconstruction wavefront. One workgroup encodes one 8x8 intra CU on
 // the current anti-diagonal: gather reference samples from the reconstructed
 // plane (availability = neighbour block on an earlier diagonal, which for DC
@@ -153,13 +152,15 @@ void main()
 	if (lvl != 0)
 		scbf = 1;
 
-	// ---- dequant ----
+	// ---- dequant (int32-safe: reorder the shifts so the intermediate never
+	// overflows, which is exact vs the spec's 64-bit form) ----
 	barrier();
 	int bd_shift = pc.bit_depth + log2n - 5;
-	int64_t dv = int64_t(lvl) * 16 * int64_t(level_scale[pc.qp % 6]);
-	dv = (dv << (pc.qp / 6));
-	dv = (dv + int64_t(1 << (bd_shift - 1))) >> bd_shift;
-	s0[t] = clip16(int(dv));
+	int sh = pc.qp / 6;
+	int m16 = lvl * 16 * level_scale[pc.qp % 6];
+	int dq = sh >= bd_shift ? (m16 << (sh - bd_shift))
+	                        : (((m16 << sh) + (1 << (bd_shift - 1))) >> bd_shift);
+	s0[t] = clip16(dq);
 	barrier();
 
 	// ---- inverse DCT ----

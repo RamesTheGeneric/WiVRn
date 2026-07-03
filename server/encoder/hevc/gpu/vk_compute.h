@@ -51,6 +51,7 @@ public:
 	uint32_t qfam = 0;
 	VkCommandPool pool = VK_NULL_HANDLE;
 	uint32_t host_mem_type = ~0u;
+	bool owns_device = false; // true when init() created the device/instance
 
 	struct buffer
 	{
@@ -130,7 +131,38 @@ public:
 		dci.pQueueCreateInfos = &qci;
 		vkcheck(vkCreateDevice(phys, &dci, nullptr, &dev), "vkCreateDevice");
 		vkGetDeviceQueue(dev, qfam, 0, &queue);
+		owns_device = true;
+		finish_setup();
+	}
 
+	// Use an already-created device (e.g. WiVRn's shared vk_bundle) instead of
+	// creating our own. The caller keeps ownership of the device/queue.
+	void adopt(VkPhysicalDevice p, VkDevice d, VkQueue q, uint32_t queue_family)
+	{
+		phys = p;
+		dev = d;
+		queue = q;
+		qfam = queue_family;
+		owns_device = false;
+		finish_setup();
+	}
+
+	~vk_compute()
+	{
+		if (pool)
+			vkDestroyCommandPool(dev, pool, nullptr);
+		if (owns_device)
+		{
+			if (dev)
+				vkDestroyDevice(dev, nullptr);
+			if (instance)
+				vkDestroyInstance(instance, nullptr);
+		}
+	}
+
+private:
+	void finish_setup()
+	{
 		VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
 		pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 		pci.queueFamilyIndex = qfam;
@@ -148,6 +180,8 @@ public:
 		if (host_mem_type == ~0u)
 			throw std::runtime_error("no host-visible coherent memory");
 	}
+
+public:
 
 	buffer make_buffer(size_t bytes)
 	{
@@ -179,6 +213,21 @@ public:
 		b = {};
 	}
 
+	void destroy_pipeline(pipeline & p)
+	{
+		if (p.dpool)
+			vkDestroyDescriptorPool(dev, p.dpool, nullptr);
+		if (p.pipe)
+			vkDestroyPipeline(dev, p.pipe, nullptr);
+		if (p.layout)
+			vkDestroyPipelineLayout(dev, p.layout, nullptr);
+		if (p.dsl)
+			vkDestroyDescriptorSetLayout(dev, p.dsl, nullptr);
+		if (p.shader)
+			vkDestroyShaderModule(dev, p.shader, nullptr);
+		p = {};
+	}
+
 	static std::vector<uint32_t> read_spv(const char * path)
 	{
 		FILE * f = std::fopen(path, "rb");
@@ -196,13 +245,20 @@ public:
 
 	pipeline make_pipeline(const char * spv_path, int nbindings, int push_bytes = 0)
 	{
+		auto code = read_spv(spv_path);
+		return make_pipeline_from_code(code.data(), code.size(), nbindings, push_bytes);
+	}
+
+	// Build a compute pipeline from SPIR-V words already in memory (the shape used
+	// inside WiVRn, where shaders are embedded as a std::map<string,vector<u32>>).
+	pipeline make_pipeline_from_code(const uint32_t * code, size_t words, int nbindings, int push_bytes = 0)
+	{
 		pipeline p;
 		p.nbindings = nbindings;
 		p.push_bytes = push_bytes;
-		auto code = read_spv(spv_path);
 		VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-		smci.codeSize = code.size() * 4;
-		smci.pCode = code.data();
+		smci.codeSize = words * 4;
+		smci.pCode = code;
 		vkcheck(vkCreateShaderModule(dev, &smci, nullptr, &p.shader), "vkCreateShaderModule");
 
 		std::vector<VkDescriptorSetLayoutBinding> binds(nbindings);
