@@ -72,28 +72,32 @@ void encoder::ensure_buffers(const h264_config & cfg, int ew, int eh)
 	const int cw2 = cw / 2, ch2 = ch / 2;
 	const int nmb = (cw / 16) * (ch / 16);
 	auto round4 = [](size_t n) { return (n + 3) & ~size_t(3); };
-	sY = vkc.make_buffer(round4((size_t)ew * eh));
-	sChroma = vkc.make_buffer(round4((size_t)ew * eh / 2));
-	rY = vkc.make_buffer((size_t)cw * ch * 4, true);
-	rCb = vkc.make_buffer((size_t)cw2 * ch2 * 4, true);
-	rCr = vkc.make_buffer((size_t)cw2 * ch2 * 4, true);
-	lDC = vkc.make_buffer((size_t)nmb * 16 * 4, true);
-	lAC = vkc.make_buffer((size_t)nmb * 256 * 4, true);
-	cDC = vkc.make_buffer((size_t)nmb * 8 * 4, true);
-	cAC = vkc.make_buffer((size_t)nmb * 128 * 4, true);
-	nnzL = vkc.make_buffer((size_t)(cw / 4) * (ch / 4) * 4, true);
-	nnzC = vkc.make_buffer((size_t)2 * (cw / 8) * (ch / 8) * 4, true);
-	scratch = vkc.make_buffer((size_t)nmb * stride_words * 4, true);
-	bitLen = vkc.make_buffer((size_t)nmb * 4, true);
-	offset = vkc.make_buffer((size_t)nmb * 4, true);
-	total = vkc.make_buffer(4, true);
-	outbits = vkc.make_buffer((size_t)nmb * stride_words * 4, true);
+	// GPU-internal buffers (never touched by the CPU in the live path) go on
+	// device-local memory; only the source upload (WC) and outbits/total (CPU-read
+	// each frame, host-cached) stay on host memory.
+	const int G = vk_compute::MEM_GPU;
+	sY = vkc.make_buffer(round4((size_t)ew * eh));                        // upload (WC)
+	sChroma = vkc.make_buffer(round4((size_t)ew * eh / 2));               // upload (WC)
+	rY = vkc.make_buffer((size_t)cw * ch * 4, G);
+	rCb = vkc.make_buffer((size_t)cw2 * ch2 * 4, G);
+	rCr = vkc.make_buffer((size_t)cw2 * ch2 * 4, G);
+	lDC = vkc.make_buffer((size_t)nmb * 16 * 4, G);
+	lAC = vkc.make_buffer((size_t)nmb * 256 * 4, G);
+	cDC = vkc.make_buffer((size_t)nmb * 8 * 4, G);
+	cAC = vkc.make_buffer((size_t)nmb * 128 * 4, G);
+	nnzL = vkc.make_buffer((size_t)(cw / 4) * (ch / 4) * 4, G);
+	nnzC = vkc.make_buffer((size_t)2 * (cw / 8) * (ch / 8) * 4, G);
+	scratch = vkc.make_buffer((size_t)nmb * stride_words * 4, G);
+	bitLen = vkc.make_buffer((size_t)nmb * 4, G);
+	offset = vkc.make_buffer((size_t)nmb * 4, G);
+	total = vkc.make_buffer(4, true);                                    // CPU reads total bits
+	outbits = vkc.make_buffer((size_t)nmb * stride_words * 4, true);      // CPU reads payload
 	// Scoreboard: MB indices in anti-diagonal (dependency) order (written once
-	// here, write-combined), a claim counter, and one done flag per MB (both
-	// GPU-filled to 0 each frame).
-	mbOrder = vkc.make_buffer((size_t)nmb * 4);
-	claim = vkc.make_buffer(4, true);
-	doneBuf = vkc.make_buffer((size_t)nmb * 4, true);
+	// here on the CPU), a claim counter, and one done flag per MB (both GPU-filled
+	// to 0 each frame).
+	mbOrder = vkc.make_buffer((size_t)nmb * 4);                          // CPU-written once (WC)
+	claim = vkc.make_buffer(4, G);
+	doneBuf = vkc.make_buffer((size_t)nmb * 4, G);
 	{
 		const int mbw = cw / 16, mbh = ch / 16;
 		auto * ord = static_cast<uint32_t *>(mbOrder.ptr);

@@ -52,6 +52,11 @@ public:
 	VkCommandPool pool = VK_NULL_HANDLE;
 	uint32_t host_mem_type = ~0u;      // HOST_VISIBLE|COHERENT — fast CPU writes (uploads)
 	uint32_t host_read_mem_type = ~0u; // + HOST_CACHED — fast CPU reads (readback)
+	uint32_t gpu_mem_type = ~0u;       // DEVICE_LOCAL(+HOST_VISIBLE via ReBAR) — GPU-only buffers
+	// make_buffer kinds: 0 = upload (write-combined, CPU writes), 1 = readback
+	// (host-cached, CPU reads), 2 = gpu (device-local; slow uncached CPU access but
+	// fastest for GPU-internal buffers — recon/level/scratch never touched by CPU).
+	static constexpr int MEM_UPLOAD = 0, MEM_READBACK = 1, MEM_GPU = 2;
 	bool owns_device = false;          // true when init() created the device/instance
 	float timestamp_period = 1.0f;     // ns per timestamp tick (device limit); for GPU-side profiling
 	bool profile_gpu = false;          // when set, begin_batch attaches a timestamp query pool
@@ -184,28 +189,37 @@ private:
 		vkGetPhysicalDeviceMemoryProperties(phys, &mp);
 		const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 		const VkMemoryPropertyFlags want_cached = want | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+		// GPU-only buffers want DEVICE_LOCAL + mappable (ReBAR); avoid the AMD
+		// device-uncached type so the buffers use the normal L1/L2 cache hierarchy.
+		const VkMemoryPropertyFlags want_gpu = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | want;
+		const VkMemoryPropertyFlags avoid_gpu = VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
 		for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
 		{
 			auto f = mp.memoryTypes[i].propertyFlags;
-			if (host_mem_type == ~0u && (f & want) == want)
+			if (host_mem_type == ~0u && (f & want) == want && !(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
 				host_mem_type = i;
 			// Prefer a coherent+cached type: fast CPU reads with no manual
 			// invalidation. On this APU the plain coherent type is write-combined,
 			// which reads at ~100 MB/s and dominated the encode time.
-			if (host_read_mem_type == ~0u && (f & want_cached) == want_cached)
+			if (host_read_mem_type == ~0u && (f & want_cached) == want_cached && !(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
 				host_read_mem_type = i;
+			if (gpu_mem_type == ~0u && (f & want_gpu) == want_gpu && !(f & avoid_gpu))
+				gpu_mem_type = i;
 		}
 		if (host_mem_type == ~0u)
 			throw std::runtime_error("no host-visible coherent memory");
 		if (host_read_mem_type == ~0u)
 			host_read_mem_type = host_mem_type; // no cached type; fall back
+		if (gpu_mem_type == ~0u)
+			gpu_mem_type = host_mem_type; // no mappable device-local type; fall back
 	}
 
 public:
 
-	// cached=true picks HOST_CACHED memory (fast CPU reads) for buffers the CPU
-	// reads back; leave false for write-mostly upload buffers.
-	buffer make_buffer(size_t bytes, bool cached = false)
+	// kind: MEM_UPLOAD (0, write-combined CPU writes), MEM_READBACK (1, host-cached
+	// CPU reads), MEM_GPU (2, device-local — GPU-only buffers). Legacy callers pass
+	// bool cached which converts to 0/1 unchanged.
+	buffer make_buffer(size_t bytes, int kind = MEM_UPLOAD)
 	{
 		buffer b;
 		b.size = bytes;
@@ -218,7 +232,7 @@ public:
 		vkGetBufferMemoryRequirements(dev, b.buf, &req);
 		VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
 		mai.allocationSize = req.size;
-		mai.memoryTypeIndex = cached ? host_read_mem_type : host_mem_type;
+		mai.memoryTypeIndex = kind == MEM_GPU ? gpu_mem_type : (kind == MEM_READBACK ? host_read_mem_type : host_mem_type);
 		vkcheck(vkAllocateMemory(dev, &mai, nullptr, &b.mem), "vkAllocateMemory");
 		vkcheck(vkBindBufferMemory(dev, b.buf, b.mem, 0), "vkBindBufferMemory");
 		vkcheck(vkMapMemory(dev, b.mem, 0, bytes, 0, &b.ptr), "vkMapMemory");
