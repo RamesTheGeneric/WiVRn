@@ -31,7 +31,7 @@ int main(int argc, char ** argv)
 	const char * spv = argc > 1 ? argv[1] : "/tmp/r264.spv";
 	vk_compute vk;
 	vk.init();
-	auto pipe = vk.make_pipeline(spv, 14, sizeof(PC));
+	auto pipe = vk.make_pipeline(spv, 15, sizeof(PC));
 
 	int fails = 0;
 	struct tc { int w, h, qp; };
@@ -61,9 +61,9 @@ int main(int argc, char ** argv)
 		const int nmb = mbw * mbh;
 		auto bSY = vk.make_buffer(round4((size_t)ew * eh));
 		auto bSC = vk.make_buffer(round4((size_t)ew * eh / 2));
-		auto bRY = vk.make_buffer((size_t)cw * ch * 4, true);
-		auto bRCb = vk.make_buffer((size_t)cw2 * ch2 * 4, true);
-		auto bRCr = vk.make_buffer((size_t)cw2 * ch2 * 4, true);
+		auto bRY = vk.make_buffer(round4((size_t)cw * ch), true);      // packed u8
+		auto bRCb = vk.make_buffer(round4((size_t)cw2 * ch2), true);   // packed u8
+		auto bRCr = vk.make_buffer(round4((size_t)cw2 * ch2), true);   // packed u8
 		auto bLDC = vk.make_buffer((size_t)nmb * 16 * 2, true);  // int16 levels
 		auto bLAC = vk.make_buffer((size_t)nmb * 256 * 2, true); // int16 levels
 		auto bCDC = vk.make_buffer((size_t)nmb * 8 * 2, true);   // int16 levels
@@ -94,16 +94,17 @@ int main(int argc, char ** argv)
 			memset(bClaim.ptr, 0, 4);
 			memset(bDone.ptr, 0, (size_t)nmb * 4);
 		}
-		std::vector<vk_compute::buffer *> binds = {&bSY, &bSC, &bRY, &bRCb, &bRCr, &bLDC, &bLAC, &bCDC, &bCAC, &bNL, &bNC, &bOrd, &bClaim, &bDone};
+		auto bHalo = vk.make_buffer((size_t)nmb * 16 * 4, true);
+		std::vector<vk_compute::buffer *> binds = {&bSY, &bSC, &bRY, &bRCb, &bRCr, &bLDC, &bLAC, &bCDC, &bCAC, &bNL, &bNC, &bOrd, &bClaim, &bDone, &bHalo};
 		const int qpc = wivrn::avc::xform::chroma_qp(t.qp);
 		PC pc{(uint32_t)mbw, (uint32_t)mbh, t.qp, qpc, (uint32_t)cw, (uint32_t)ch, (uint32_t)ew, (uint32_t)eh, (uint32_t)nmb};
 		vk.run(pipe, binds, std::min(nmb, 64), 1, 1, &pc, sizeof(pc));
 
 		int mism = 0;
-		auto * gY = (int32_t *)bRY.ptr; auto * gCb = (int32_t *)bRCb.ptr; auto * gCr = (int32_t *)bRCr.ptr;
-		for (size_t i = 0; i < (size_t)cw * ch; ++i) if ((uint8_t)gY[i] != cRecY[i]) ++mism;
-		for (size_t i = 0; i < (size_t)cw2 * ch2; ++i) if ((uint8_t)gCb[i] != cRecCb[i]) ++mism;
-		for (size_t i = 0; i < (size_t)cw2 * ch2; ++i) if ((uint8_t)gCr[i] != cRecCr[i]) ++mism;
+		auto * gY = (uint8_t *)bRY.ptr; auto * gCb = (uint8_t *)bRCb.ptr; auto * gCr = (uint8_t *)bRCr.ptr; // packed u8
+		for (size_t i = 0; i < (size_t)cw * ch; ++i) if (gY[i] != cRecY[i]) ++mism;
+		for (size_t i = 0; i < (size_t)cw2 * ch2; ++i) if (gCb[i] != cRecCb[i]) ++mism;
+		for (size_t i = 0; i < (size_t)cw2 * ch2; ++i) if (gCr[i] != cRecCr[i]) ++mism;
 		if (mism) ++fails;
 		printf("%dx%d qp%d (%d MBs): recon mismatch=%d  %s\n", t.w, t.h, t.qp, nmb, mism, mism ? "FAIL" : "PASS");
 

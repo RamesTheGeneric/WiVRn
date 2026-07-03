@@ -44,7 +44,7 @@ void encoder::init_adopt(VkPhysicalDevice phys, VkDevice dev, VkQueue queue, uin
                          const uint32_t * stitch_spv, size_t stitch_words)
 {
 	vkc.adopt(phys, dev, queue, qfam);
-	recon = vkc.make_pipeline_from_code(recon_spv, recon_words, 14, sizeof(RPC));
+	recon = vkc.make_pipeline_from_code(recon_spv, recon_words, 15, sizeof(RPC));
 	emit = vkc.make_pipeline_from_code(emit_spv, emit_words, 8, sizeof(EPC));
 	prefix = vkc.make_pipeline_from_code(prefix_spv, prefix_words, 3, sizeof(PPC));
 	stitch = vkc.make_pipeline_from_code(stitch_spv, stitch_words, 4, sizeof(SPC));
@@ -54,7 +54,7 @@ void encoder::init_adopt(VkPhysicalDevice phys, VkDevice dev, VkQueue queue, uin
 void encoder::init_own(const char * recon_path, const char * emit_path, const char * prefix_path, const char * stitch_path)
 {
 	vkc.init();
-	recon = vkc.make_pipeline(recon_path, 14, sizeof(RPC));
+	recon = vkc.make_pipeline(recon_path, 15, sizeof(RPC));
 	emit = vkc.make_pipeline(emit_path, 8, sizeof(EPC));
 	prefix = vkc.make_pipeline(prefix_path, 3, sizeof(PPC));
 	stitch = vkc.make_pipeline(stitch_path, 4, sizeof(SPC));
@@ -66,7 +66,7 @@ void encoder::ensure_buffers(const h264_config & cfg, int ew, int eh)
 	const int cw = cfg.coded_width(), ch = cfg.coded_height();
 	if (alloc_cw == cw && alloc_ch == ch && alloc_ew == ew)
 		return;
-	for (auto * b : {&sY, &sChroma, &rY, &rCb, &rCr, &lDC, &lAC, &cDC, &cAC, &nnzL, &nnzC, &scratch, &bitLen, &offset, &total, &outbits, &mbOrder, &claim, &doneBuf})
+	for (auto * b : {&sY, &sChroma, &rY, &rCb, &rCr, &lDC, &lAC, &cDC, &cAC, &nnzL, &nnzC, &scratch, &bitLen, &offset, &total, &outbits, &mbOrder, &claim, &doneBuf, &haloBuf})
 		vkc.destroy_buffer(*b);
 
 	const int cw2 = cw / 2, ch2 = ch / 2;
@@ -78,9 +78,9 @@ void encoder::ensure_buffers(const h264_config & cfg, int ew, int eh)
 	const int G = vk_compute::MEM_GPU;
 	sY = vkc.make_buffer(round4((size_t)ew * eh));                        // upload (WC)
 	sChroma = vkc.make_buffer(round4((size_t)ew * eh / 2));               // upload (WC)
-	rY = vkc.make_buffer((size_t)cw * ch * 4, G);
-	rCb = vkc.make_buffer((size_t)cw2 * ch2 * 4, G);
-	rCr = vkc.make_buffer((size_t)cw2 * ch2 * 4, G);
+	rY = vkc.make_buffer(round4((size_t)cw * ch), G);      // packed u8
+	rCb = vkc.make_buffer(round4((size_t)cw2 * ch2), G);   // packed u8
+	rCr = vkc.make_buffer(round4((size_t)cw2 * ch2), G);   // packed u8
 	lDC = vkc.make_buffer((size_t)nmb * 16 * 2, G);  // int16 levels
 	lAC = vkc.make_buffer((size_t)nmb * 256 * 2, G); // int16 levels
 	cDC = vkc.make_buffer((size_t)nmb * 8 * 2, G);   // int16 levels
@@ -98,6 +98,7 @@ void encoder::ensure_buffers(const h264_config & cfg, int ew, int eh)
 	mbOrder = vkc.make_buffer((size_t)nmb * 4);                          // CPU-written once (WC)
 	claim = vkc.make_buffer(4, G);
 	doneBuf = vkc.make_buffer((size_t)nmb * 4, G);
+	haloBuf = vkc.make_buffer((size_t)nmb * 16 * 4, G);                  // 64B/MB boundary pixels
 	{
 		const int mbw = cw / 16, mbh = ch / 16;
 		auto * ord = static_cast<uint32_t *>(mbOrder.ptr);
@@ -133,7 +134,7 @@ std::vector<uint8_t> encoder::encode_frame(const h264_config & cfg, int ew, int 
 	// dispatch instead of ~99 pipeline barriers. N stays <= the co-resident
 	// workgroup count for forward progress; 64 is trivially resident on the
 	// 16-CU APU and exceeds the max anti-diagonal width (no lost parallelism).
-	std::vector<vk_compute::buffer *> rbind = {&sY, &sChroma, &rY, &rCb, &rCr, &lDC, &lAC, &cDC, &cAC, &nnzL, &nnzC, &mbOrder, &claim, &doneBuf};
+	std::vector<vk_compute::buffer *> rbind = {&sY, &sChroma, &rY, &rCb, &rCr, &lDC, &lAC, &cDC, &cAC, &nnzL, &nnzC, &mbOrder, &claim, &doneBuf, &haloBuf};
 	const RPC rpc{(uint32_t)mbw, (uint32_t)mbh, cfg.qp, qpc, (uint32_t)cw, (uint32_t)ch, (uint32_t)ew, (uint32_t)eh, (uint32_t)nmb};
 	uint32_t recon_wg_cap = 64u;
 	if (const char * e = std::getenv("WIVRN_H264_RECON_WG")) { int w = std::atoi(e); if (w > 0) recon_wg_cap = (uint32_t)w; }
@@ -206,8 +207,7 @@ std::vector<uint8_t> encoder::encode_frame(const h264_config & cfg, int ew, int 
 
 	auto copy_rec = [](uint8_t * dst, const vk_compute::buffer & b, size_t n) {
 		if (!dst) return;
-		auto * s = (const int32_t *)b.ptr;
-		for (size_t i = 0; i < n; ++i) dst[i] = (uint8_t)s[i];
+		std::memcpy(dst, b.ptr, n); // recon planes are packed u8
 	};
 	copy_rec(recY, rY, (size_t)cw * ch);
 	copy_rec(recCb, rCb, (size_t)cw2 * ch2);

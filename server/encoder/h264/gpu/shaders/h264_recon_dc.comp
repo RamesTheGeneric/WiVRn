@@ -23,11 +23,12 @@ layout(local_size_x = 32) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer SrcY { uint v[]; } srcY;   // packed u8 luma (ew*eh)
 layout(set = 0, binding = 1, std430) readonly buffer SrcC { uint v[]; } srcC;   // packed u8 interleaved CbCr
-// recon planes are coherent: neighbours' reconstruction is read across
-// workgroups, so each access is made available/visible at device scope.
-layout(set = 0, binding = 2, std430) coherent buffer RecY { int v[]; } recY;    // coded cw*ch
-layout(set = 0, binding = 3, std430) coherent buffer RecCb { int v[]; } recCb;
-layout(set = 0, binding = 4, std430) coherent buffer RecCr { int v[]; } recCr;
+// recon planes: NON-coherent, packed u8 (4 px/word), write-only. Neighbours no
+// longer read these (they read the coherent `halo` buffer instead), so the bulk
+// reconstruction never touches coherent/L2-synced memory.
+layout(set = 0, binding = 2, std430) writeonly buffer RecY { uint v[]; } recY;    // coded cw*ch packed u8
+layout(set = 0, binding = 3, std430) writeonly buffer RecCb { uint v[]; } recCb;
+layout(set = 0, binding = 4, std430) writeonly buffer RecCr { uint v[]; } recCr;
 layout(set = 0, binding = 5, std430) writeonly buffer OutLDC { int16_t v[]; } outLDC;   // [nmb*16]
 layout(set = 0, binding = 6, std430) writeonly buffer OutLAC { int16_t v[]; } outLAC;   // [nmb*16*16]
 layout(set = 0, binding = 7, std430) writeonly buffer OutCDC { int16_t v[]; } outCDC;   // [nmb*2*4]
@@ -39,6 +40,10 @@ layout(set = 0, binding = 10, std430) writeonly buffer OutNC { uint v[]; } outNC
 layout(set = 0, binding = 11, std430) readonly buffer MbOrder { uint v[]; } mbOrder; // [nmb]
 layout(set = 0, binding = 12, std430) coherent buffer Claim { uint v[]; } claim;      // [1] atomic counter
 layout(set = 0, binding = 13, std430) coherent buffer Done { uint v[]; } done;         // [nmb] atomic 0/1
+// Halo: the ONLY reconstruction data neighbours read. 16 words (64B) per MB:
+// w0-3 luma bottom row (16 px u8), w4-7 luma right col, w8-9/10-11 Cb bottom/right,
+// w12-13/14-15 Cr bottom/right. Coherent, written before the done-flag RELEASE.
+layout(set = 0, binding = 14, std430) coherent buffer Halo { uint v[]; } halo;         // [nmb*16]
 
 layout(push_constant) uniform PC {
 	uint mbw, mbh;
@@ -55,6 +60,8 @@ const int VS[6][3] = int[6][3](int[3](10, 16, 13), int[3](11, 18, 14), int[3](13
 
 int clsOf(int i, int j) { return (i % 2 == 0 && j % 2 == 0) ? 0 : ((i % 2 == 1 && j % 2 == 1) ? 1 : 2); }
 int clippix(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
+int sum4(uint p) { return int(p & 0xffu) + int((p >> 8) & 0xffu) + int((p >> 16) & 0xffu) + int((p >> 24) & 0xffu); }
+uint pack4(int a, int b, int c, int d) { return uint(a) | (uint(b) << 8) | (uint(c) << 16) | (uint(d) << 24); }
 
 int u8Y(int x, int y)
 {
@@ -169,13 +176,14 @@ void main()
 	uint nmb_idx = mby * pc.mbw + mbx;
 
 	// ---- predictions (parallel: thread 0 = luma DC, threads 1..8 = the 8 chroma
-	// sub-block DCs, one lane each) ----
+	// sub-block DCs). Neighbour reconstruction comes from the coherent halo:
+	// top-neighbour bottom row / left-neighbour right col. ----
+	uint htop = (nmb_idx - pc.mbw) * 16u; // MB-above halo base (valid iff availT)
+	uint hlft = (nmb_idx - 1u) * 16u;      // MB-left  halo base (valid iff availL)
 	if (t == 0u) {
 		int sT = 0, sL = 0;
-		for (int i = 0; i < 16; ++i) {
-			if (availT) sT += recY.v[(py - 1) * cw + (px + i)];
-			if (availL) sL += recY.v[(py + i) * cw + (px - 1)];
-		}
+		if (availT) for (int w = 0; w < 4; ++w) sT += sum4(halo.v[htop + uint(w)]);       // top bottom row
+		if (availL) for (int w = 0; w < 4; ++w) sL += sum4(halo.v[hlft + 4u + uint(w)]);  // left right col
 		if (availT && availL) predY = (sT + sL + 16) >> 5;
 		else if (availT) predY = (sT + 8) >> 4;
 		else if (availL) predY = (sL + 8) >> 4;
@@ -185,10 +193,9 @@ void main()
 		int sb = int(t - 1u) % 4;
 		int sbx = (sb & 1) * 4, sby = (sb >> 1) * 4;
 		int cT = 0, cL = 0;
-		for (int i = 0; i < 4; ++i) {
-			if (availT) cT += (comp == 0 ? recCb.v[(cpy - 1) * cw2 + (cpx + sbx + i)] : recCr.v[(cpy - 1) * cw2 + (cpx + sbx + i)]);
-			if (availL) cL += (comp == 0 ? recCb.v[(cpy + sby + i) * cw2 + (cpx - 1)] : recCr.v[(cpy + sby + i) * cw2 + (cpx - 1)]);
-		}
+		// chroma bottom-row words 8-9(Cb)/12-13(Cr); right-col words 10-11/14-15
+		if (availT) cT = sum4(halo.v[htop + 8u + uint(comp) * 4u + uint(sbx >> 2)]);
+		if (availL) cL = sum4(halo.v[hlft + 10u + uint(comp) * 4u + uint(sby >> 2)]);
 		int pcv;
 		bool diag = (sbx == 0 && sby == 0) || (sbx > 0 && sby > 0);
 		if (diag) {
@@ -299,13 +306,19 @@ void main()
 	}
 	barrier();
 
-	// ---- reconstruction (AC levels come from carry_lv, not a memory re-read) ----
+	// ---- reconstruction (AC levels from carry_lv). Writes the packed-u8 recon
+	// plane (4 px/word) and, on boundary blocks, this MB's coherent halo. ----
+	uint cwW = uint(cw) >> 2u; // luma words per row
 	if (t < 16u) {
 		int bx = int(t & 3u), by = int(t >> 2);
 		int res[16];
 		idct4(carry_lv, pc.qp, dcYL[by*4+bx], res);
-		for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c)
-			recY.v[(py + by*4 + r) * cw + (px + bx*4 + c)] = clippix(predY + res[r*4+c]);
+		int rc[16];
+		for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) rc[r*4+c] = clippix(predY + res[r*4+c]);
+		for (int r = 0; r < 4; ++r)
+			recY.v[uint(py + by*4 + r) * cwW + (uint(px + bx*4) >> 2u)] = pack4(rc[r*4+0], rc[r*4+1], rc[r*4+2], rc[r*4+3]);
+		if (by == 3) halo.v[nmb_idx * 16u + uint(bx)] = pack4(rc[12], rc[13], rc[14], rc[15]);        // bottom row
+		if (bx == 3) halo.v[nmb_idx * 16u + 4u + uint(by)] = pack4(rc[3], rc[7], rc[11], rc[15]);     // right col
 	} else if (t < 24u) {
 		int comp = (t < 20u) ? 0 : 1;
 		int sb = int(t) - (comp == 0 ? 16 : 20);
@@ -314,11 +327,16 @@ void main()
 		int dcov = comp == 0 ? dcYCb[(sby/4)*2+(sbx/4)] : dcYCr[(sby/4)*2+(sbx/4)];
 		int res[16];
 		idct4(carry_lv, pc.qpc, dcov, res);
-		for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) {
-			int val = clippix(pcv + res[r*4+c]);
-			if (comp == 0) recCb.v[(cpy + sby + r) * cw2 + (cpx + sbx + c)] = val;
-			else recCr.v[(cpy + sby + r) * cw2 + (cpx + sbx + c)] = val;
+		int rc[16];
+		for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) rc[r*4+c] = clippix(pcv + res[r*4+c]);
+		uint cw2W = uint(cw) >> 3u; // chroma words per row = (cw/2)/4
+		for (int r = 0; r < 4; ++r) {
+			uint word = uint(cpy + sby + r) * cw2W + (uint(cpx + sbx) >> 2u);
+			uint packed = pack4(rc[r*4+0], rc[r*4+1], rc[r*4+2], rc[r*4+3]);
+			if (comp == 0) recCb.v[word] = packed; else recCr.v[word] = packed;
 		}
+		if (sby == 4) halo.v[nmb_idx * 16u + 8u + uint(comp) * 4u + uint(sbx >> 2)] = pack4(rc[12], rc[13], rc[14], rc[15]);
+		if (sbx == 4) halo.v[nmb_idx * 16u + 10u + uint(comp) * 4u + uint(sby >> 2)] = pack4(rc[3], rc[7], rc[11], rc[15]);
 	}
 
 	// All lanes have written this MB's reconstruction (coherent -> device
