@@ -112,6 +112,13 @@ if (WIVRN_BUILD_SERVER)
 			encoder/idr_handler.cpp
 			encoder/video_encoder.cpp
 			encoder/video_encoder_raw.cpp
+			encoder/video_encoder_hevc.cpp
+			encoder/hevc/bitwriter.cpp
+			encoder/hevc/param_sets.cpp
+			encoder/hevc/cabac_reference.cpp
+			encoder/hevc/transform.cpp
+			encoder/hevc/residual_coding.cpp
+			encoder/hevc/cpu_encoder.cpp
 
 			driver/app_pacer.cpp
 			driver/clock_offset.cpp

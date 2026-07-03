@@ -44,6 +44,8 @@
 #endif
 #include "video_encoder_raw.h"
 
+#include "video_encoder_hevc.h"
+
 namespace wivrn
 {
 
@@ -156,6 +158,11 @@ std::unique_ptr<video_encoder> video_encoder::create(
 	if (settings.encoder_name == encoder_raw)
 	{
 		res = std::make_unique<video_encoder_raw>(wivrn_vk, settings, stream_idx);
+	}
+
+	if (settings.encoder_name == encoder_hevc)
+	{
+		res = std::make_unique<video_encoder_hevc>(wivrn_vk, settings, stream_idx);
 	}
 
 	if (not res)

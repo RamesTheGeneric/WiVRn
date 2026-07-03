@@ -223,6 +223,11 @@ public:
 		if (config.codec == video_codec::raw or config.name == encoder_raw)
 			return {encoder_raw, video_codec::raw};
 
+		// From-scratch HEVC compute encoder: explicit opt-in only (for machines
+		// with GPU compute but no hardware video encoder). Always H.265.
+		if (config.name == encoder_hevc)
+			return {encoder_hevc, config.codec.value_or(video_codec::h265)};
+
 #if WIVRN_USE_NVENC
 		if ((nvidia and config.name.empty()) or config.name == encoder_nvenc)
 		{

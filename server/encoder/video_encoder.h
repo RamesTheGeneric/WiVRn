@@ -45,6 +45,7 @@ inline const char * encoder_vaapi = "vaapi";
 inline const char * encoder_x264 = "x264";
 inline const char * encoder_vulkan = "vulkan";
 inline const char * encoder_raw = "raw";
+inline const char * encoder_hevc = "hevc"; // from-scratch HEVC intra encoder (no HW encoder needed)
 
 class video_encoder
 {
