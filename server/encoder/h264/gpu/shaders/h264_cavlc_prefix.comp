@@ -1,8 +1,12 @@
 #version 460
-// Prefix-sum of per-MB CAVLC bit lengths -> per-MB starting bit offset, plus the
-// total bit count. Single workgroup, one thread (nmb <= a few thousand; this is a
-// tiny serial scan compared to the parallel emit/stitch).
-layout(local_size_x = 1) in;
+// Exclusive prefix-sum of per-MB CAVLC bit lengths -> per-MB starting bit
+// offset, plus the total bit count. One workgroup, blocked parallel scan: the
+// 256 lanes split [0,nmb) into contiguous segments, each lane sums its segment,
+// a shared Hillis-Steele scan turns the segment sums into per-segment base
+// offsets, then each lane writes its segment's offsets. Serial depth drops from
+// nmb (a few thousand) to ~nmb/256 + log2(256) — the single-thread version was
+// ~200us at 1080p-class MB counts.
+layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer BitLen { uint v[]; } bitLen; // [nmb]
 layout(set = 0, binding = 1, std430) writeonly buffer Offset { uint v[]; } offset; // [nmb]
@@ -13,9 +17,41 @@ layout(set = 0, binding = 2, std430) writeonly buffer Total { uint v[]; } total;
 // the MB payload at absolute bit offsets starting at base_bits).
 layout(push_constant) uniform PC { uint nmb; uint base_bits; } pc;
 
+const uint T = 256u;
+shared uint seg_sum[T]; // per-lane segment total
+shared uint scan[T];    // inclusive scan of seg_sum
+
 void main()
 {
-	uint acc = pc.base_bits;
-	for (uint i = 0u; i < pc.nmb; ++i) { offset.v[i] = acc; acc += bitLen.v[i]; }
-	total.v[0] = acc; // = base_bits + sum(bitLen) = total slice-data bits
+	uint tid = gl_LocalInvocationID.x;
+	uint n = pc.nmb;
+	uint per = (n + T - 1u) / T;    // elements per segment (ceil)
+	uint s0 = min(tid * per, n);
+	uint s1 = min(s0 + per, n);
+
+	// pass 1: this lane's segment sum
+	uint sum = 0u;
+	for (uint i = s0; i < s1; ++i) sum += bitLen.v[i];
+	seg_sum[tid] = sum;
+	scan[tid] = sum;
+	barrier();
+
+	// inclusive Hillis-Steele scan of the 256 segment sums
+	for (uint off = 1u; off < T; off <<= 1u) {
+		uint add = (tid >= off) ? scan[tid - off] : 0u;
+		barrier();
+		scan[tid] += add;
+		barrier();
+	}
+
+	// per-segment base = base_bits + (exclusive prefix) = base_bits + incl - own
+	uint base = pc.base_bits + scan[tid] - seg_sum[tid];
+
+	// pass 2: write this segment's absolute bit offsets
+	uint acc = base;
+	for (uint i = s0; i < s1; ++i) { offset.v[i] = acc; acc += bitLen.v[i]; }
+
+	// grand total = base_bits + sum(all) = last lane's inclusive scan + base_bits
+	if (tid == T - 1u)
+		total.v[0] = pc.base_bits + scan[T - 1u];
 }
