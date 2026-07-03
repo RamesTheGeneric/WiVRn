@@ -70,7 +70,7 @@ video_encoder_h2_67::video_encoder_h2_67(
                       vk.transfer_queue ? vk.transfer_queue.family_index : vk.queue.family_index,
                       settings,
                       std::make_unique<default_idr_handler>(),
-                      false),
+                      true),
         vk{vk},
         cmd_pool{make_cmd_pool(vk, stream_idx)}
 {
