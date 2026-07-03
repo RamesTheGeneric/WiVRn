@@ -69,7 +69,8 @@ public:
 	                                  uint8_t * recY = nullptr, uint8_t * recCb = nullptr, uint8_t * recCr = nullptr);
 
 	// Timing (microseconds) of the last encode_frame's stages.
-	struct timings { double upload = 0, recon_us = 0, cavlc_us = 0, assemble_us = 0; } last_timings{};
+	struct timings { double upload = 0, recon_us = 0, cavlc_us = 0, assemble_us = 0;
+	                 double emit_us = 0, prefix_us = 0, stitch_us = 0; } last_timings{};
 };
 
 } // namespace wivrn::avc::gpu
