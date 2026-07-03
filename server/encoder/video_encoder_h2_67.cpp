@@ -101,11 +101,6 @@ video_encoder_h2_67::video_encoder_h2_67(
 	        luma_spv.data(), luma_spv.size(),
 	        chroma_spv.data(), chroma_spv.size());
 
-	const int cw = cfg.coded_width(), ch = cfg.coded_height();
-	src_y.resize((size_t)cw * ch);
-	src_cb.resize((size_t)(cw / 2) * (ch / 2));
-	src_cr.resize((size_t)(cw / 2) * (ch / 2));
-
 	auto command_buffers = vk.device.allocateCommandBuffers(
 	        {.commandPool = *cmd_pool, .commandBufferCount = num_slots});
 	for (size_t i = 0; i < num_slots; ++i)
@@ -194,34 +189,15 @@ std::optional<video_encoder::data> video_encoder_h2_67::encode(uint8_t slot, uin
 		return std::chrono::duration<double, std::micro>(b - a).count();
 	};
 	auto t_build0 = clk::now();
-
-	// Build the CTB-aligned coded-size source planes (int), replicating edge
-	// samples into the padding, which the conformance window crops out.
-	const int cw = cfg.coded_width(), ch = cfg.coded_height();
-	const int ew = extent.width, eh = extent.height;
-	for (int y = 0; y < ch; ++y)
-	{
-		const int sy = y < eh ? y : eh - 1;
-		for (int x = 0; x < cw; ++x)
-			src_y[(size_t)y * cw + x] = luma[(size_t)sy * luma_stride + (x < ew ? x : ew - 1)];
-	}
-	for (int y = 0; y < ch / 2; ++y)
-	{
-		const int sy = y < eh / 2 ? y : eh / 2 - 1;
-		for (int x = 0; x < cw / 2; ++x)
-		{
-			const int sx = x < ew / 2 ? x : ew / 2 - 1;
-			src_cb[(size_t)y * (cw / 2) + x] = chroma[(size_t)sy * chroma_stride + sx * 2 + 0];
-			src_cr[(size_t)y * (cw / 2) + x] = chroma[(size_t)sy * chroma_stride + sx * 2 + 1];
-		}
-	}
-
+	// Source planes are uploaded raw (luma_stride == extent.width, chroma packed
+	// at extent.width/2 pairs) and edge-clamp-sampled on the GPU; no CPU repack.
 	auto t_recon0 = clk::now();
+
 	// GPU reconstruction wavefront -> per-CU levels/cbf. The shared queue is
 	// mutex-protected; the reconstructor submits and waits on it.
 	{
 		std::unique_lock lock(vk.queue.mutex);
-		recon.reconstruct(cfg, src_y.data(), src_cb.data(), src_cr.data(), bs);
+		recon.reconstruct(cfg, extent.width, extent.height, luma, chroma, bs);
 	}
 
 	auto t_cabac0 = clk::now();

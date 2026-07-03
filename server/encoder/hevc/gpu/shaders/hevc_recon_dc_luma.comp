@@ -7,11 +7,23 @@
 // prediction -> write reconstruction. Bit-exact port of cpu_encoder's DC path.
 layout(local_size_x = 64) in;
 
-layout(set = 0, binding = 0, std430) readonly buffer SrcY { int v[]; } srcY;
+// srcY is the raw 8-bit Y plane at extent resolution (ew x eh, stride ew), packed
+// 4 samples per uint. Sampled with edge-clamp so the coded-size padding needs no
+// CPU work.
+layout(set = 0, binding = 0, std430) readonly buffer SrcY { uint v[]; } srcY;
 layout(set = 0, binding = 1, std430) buffer RecY { int v[]; } recY;
 layout(set = 0, binding = 2, std430) writeonly buffer LevY { int v[]; } levY;
 layout(set = 0, binding = 3, std430) writeonly buffer CbfY { uint v[]; } cbfY;
-layout(push_constant) uniform PC { uint w; uint h; int qp; int bit_depth; uint diag; uint bx_start; } pc;
+layout(push_constant) uniform PC { uint w; uint h; int qp; int bit_depth; uint diag; uint bx_start; uint ew; uint eh; uint comp; } pc;
+
+int srcSample(int sx, int sy)
+{
+	sx = sx < int(pc.ew) ? sx : int(pc.ew) - 1; // edge-replicate into padding
+	sy = sy < int(pc.eh) ? sy : int(pc.eh) - 1;
+	uint bidx = uint(sy) * pc.ew + uint(sx);
+	uint word = srcY.v[bidx >> 2u];
+	return int((word >> ((bidx & 3u) * 8u)) & 0xffu);
+}
 
 const int M[64] = int[64](
 	64, 64, 64, 64, 64, 64, 64, 64,
@@ -127,7 +139,7 @@ void main()
 	spred[t] = p;
 
 	// ---- residual ----
-	s0[t] = srcY.v[(py + y) * int(W) + (px + x)] - p;
+	s0[t] = srcSample(px + x, py + y) - p;
 	barrier();
 
 	// ---- forward DCT ----

@@ -5,11 +5,23 @@
 // Run once per chroma component with that component's src/recon/level buffers.
 layout(local_size_x = 16) in;
 
-layout(set = 0, binding = 0, std430) readonly buffer SrcC { int v[]; } srcC;
+// srcC is the raw 8-bit interleaved CbCr plane at extent chroma resolution
+// (ew x eh pairs, stride ew), packed 4 bytes per uint. comp selects the component
+// (0=Cb, 1=Cr). Sampled with edge-clamp so the coded-size padding needs no CPU work.
+layout(set = 0, binding = 0, std430) readonly buffer SrcC { uint v[]; } srcC;
 layout(set = 0, binding = 1, std430) buffer RecC { int v[]; } recC;
 layout(set = 0, binding = 2, std430) writeonly buffer LevC { int v[]; } levC;
 layout(set = 0, binding = 3, std430) writeonly buffer CbfC { uint v[]; } cbfC;
-layout(push_constant) uniform PC { uint w; uint h; int qp; int bit_depth; uint diag; uint bx_start; } pc;
+layout(push_constant) uniform PC { uint w; uint h; int qp; int bit_depth; uint diag; uint bx_start; uint ew; uint eh; uint comp; } pc;
+
+int srcSample(int sx, int sy)
+{
+	sx = sx < int(pc.ew) ? sx : int(pc.ew) - 1; // edge-replicate into padding
+	sy = sy < int(pc.eh) ? sy : int(pc.eh) - 1;
+	uint bidx = (uint(sy) * pc.ew + uint(sx)) * 2u + pc.comp; // interleaved byte index
+	uint word = srcC.v[bidx >> 2u];
+	return int((word >> ((bidx & 3u) * 8u)) & 0xffu);
+}
 
 const int M[16] = int[16](
 	64, 64, 64, 64,
@@ -112,7 +124,7 @@ void main()
 	int dc = (sum + N) >> (log2n + 1);
 	spred[t] = dc;
 
-	s0[t] = srcC.v[(py + y) * int(W) + (px + x)] - dc;
+	s0[t] = srcSample(px + x, py + y) - dc;
 	barrier();
 
 	// forward DCT-4

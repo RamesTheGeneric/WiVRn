@@ -59,8 +59,7 @@ class video_encoder_h2_67 : public video_encoder
 	std::vector<uint8_t> parameter_sets;
 
 	h267::gpu::reconstructor recon;
-	// Reused host-side coded-size source planes and syntax across frames.
-	std::vector<int32_t> src_y, src_cb, src_cr;
+	// Reused per-CU syntax across frames (source planes go straight to the GPU).
 	h267::block_syntax bs;
 
 	// Rolling per-stage profile, averaged and logged every prof_window frames.

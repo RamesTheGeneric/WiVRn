@@ -40,21 +40,27 @@ int chroma_qp(int q)
 #pragma pack(push, 1)
 struct push_const
 {
-	uint32_t w, h;
+	uint32_t w, h; // coded plane dims
 	int32_t qp, bd;
 	uint32_t diag, bx_start;
+	uint32_t ew, eh; // extent (source) dims, this plane's samples
+	uint32_t comp;   // chroma component: 0=Cb, 1=Cr (luma ignores)
 };
 #pragma pack(pop)
 
-// Per-diagonal wavefront steps for a bw x bh block grid.
-std::vector<vk_compute::step> wavefront_steps(int W, int H, int qp, int bw, int bh)
+// Per-diagonal wavefront steps for a bw x bh block grid. ew/eh are the extent
+// source dims (for in-shader edge-clamp), comp selects the interleaved chroma
+// component.
+std::vector<vk_compute::step> wavefront_steps(int W, int H, int qp, int bw, int bh,
+                                              int ew, int eh, int comp)
 {
 	std::vector<vk_compute::step> steps;
 	for (int d = 0; d <= bw + bh - 2; ++d)
 	{
 		int bxs = std::max(0, d - (bh - 1));
 		int bxe = std::min(d, bw - 1);
-		push_const pcv{(uint32_t)W, (uint32_t)H, qp, 8, (uint32_t)d, (uint32_t)bxs};
+		push_const pcv{(uint32_t)W, (uint32_t)H, qp, 8, (uint32_t)d, (uint32_t)bxs,
+		               (uint32_t)ew, (uint32_t)eh, (uint32_t)comp};
 		vk_compute::step s;
 		s.gx = (uint32_t)(bxe - bxs + 1);
 		s.gy = 1;
@@ -85,23 +91,25 @@ void reconstructor::init_own(const char * luma_spv_path, const char * chroma_spv
 	ready = true;
 }
 
-void reconstructor::ensure_buffers(int cw, int ch)
+void reconstructor::ensure_buffers(int cw, int ch, int ew, int eh)
 {
 	if (alloc_cw == cw && alloc_ch == ch)
 		return;
-	for (auto * b: {&sY, &rY, &lY, &cY, &sCb, &rCb, &lCb, &cCb, &sCr, &rCr, &lCr, &cCr})
+	for (auto * b: {&sY, &rY, &lY, &cY, &sChroma, &rCb, &lCb, &cCb, &rCr, &lCr, &cCr})
 		vkc.destroy_buffer(*b);
 
 	const int cw2 = cw / 2, ch2 = ch / 2, bw = cw / 8, bh = ch / 8, nb = bw * bh;
-	// Source planes (s*) are written by the CPU then read by the GPU: keep them
-	// write-combined. Everything the CPU reads back (levels l*, cbf c*, recon r*)
-	// is allocated cached so those reads run at cache speed, not ~100 MB/s WC.
-	sY = vkc.make_buffer((size_t)cw * ch * 4);
+	auto round4 = [](size_t n) { return (n + 3) & ~size_t(3); };
+	// Source buffers hold the raw uint8 compositor planes (packed 4 bytes/uint),
+	// sized to the extent, not the coded size: the shaders edge-clamp-sample them,
+	// so the CPU no longer pads/widens. Written by the CPU then read by the GPU ->
+	// keep write-combined. Everything the CPU reads back (levels l*, cbf c*, recon
+	// r*) is cached so those reads run at cache speed, not ~100 MB/s WC.
+	sY = vkc.make_buffer(round4((size_t)ew * eh));            // luma: 1 byte/sample
+	sChroma = vkc.make_buffer(round4((size_t)ew * eh / 2));   // CbCr interleaved: 2 bytes/pair
 	rY = vkc.make_buffer((size_t)cw * ch * 4, /*cached=*/true);
 	lY = vkc.make_buffer((size_t)nb * 64 * 4, /*cached=*/true);
 	cY = vkc.make_buffer((size_t)nb * 4, /*cached=*/true);
-	for (auto * s: {&sCb, &sCr})
-		*s = vkc.make_buffer((size_t)cw2 * ch2 * 4);
 	for (auto * s: {&rCb, &rCr})
 		*s = vkc.make_buffer((size_t)cw2 * ch2 * 4, /*cached=*/true);
 	for (auto * s: {&lCb, &lCr})
@@ -113,7 +121,8 @@ void reconstructor::ensure_buffers(int cw, int ch)
 }
 
 void reconstructor::reconstruct(const hevc_config & cfg,
-                                const int32_t * srcY, const int32_t * srcCb, const int32_t * srcCr,
+                                int ew, int eh,
+                                const uint8_t * lumaU8, const uint8_t * chromaU8,
                                 block_syntax & bs,
                                 uint8_t * recY, uint8_t * recCb, uint8_t * recCr)
 {
@@ -124,20 +133,22 @@ void reconstructor::reconstruct(const hevc_config & cfg,
 
 	const int cw = cfg.coded_width(), ch = cfg.coded_height();
 	const int cw2 = cw / 2, ch2 = ch / 2, bw = cw / 8, bh = ch / 8, nb = bw * bh;
-	ensure_buffers(cw, ch);
+	const int ew2 = ew / 2, eh2 = eh / 2;
+	ensure_buffers(cw, ch, ew, eh);
 
 	auto t0 = clk::now();
-	std::memcpy(sY.ptr, srcY, (size_t)cw * ch * 4);
-	std::memcpy(sCb.ptr, srcCb, (size_t)cw2 * ch2 * 4);
-	std::memcpy(sCr.ptr, srcCr, (size_t)cw2 * ch2 * 4);
+	// Upload the raw compositor planes verbatim (no CPU pad/de-interleave); the
+	// shaders edge-clamp-sample them up to the coded size.
+	std::memcpy(sY.ptr, lumaU8, (size_t)ew * eh);
+	std::memcpy(sChroma.ptr, chromaU8, (size_t)ew * eh / 2);
 
 	auto t1 = clk::now();
-	vkc.run_wavefront(pl, {&sY, &rY, &lY, &cY}, wavefront_steps(cw, ch, cfg.qp, bw, bh));
+	vkc.run_wavefront(pl, {&sY, &rY, &lY, &cY}, wavefront_steps(cw, ch, cfg.qp, bw, bh, ew, eh, 0));
 	auto t2 = clk::now();
 	const int qc = chroma_qp(cfg.qp);
-	auto chroma_steps = wavefront_steps(cw2, ch2, qc, bw, bh);
-	vkc.run_wavefront(pc, {&sCb, &rCb, &lCb, &cCb}, chroma_steps);
-	vkc.run_wavefront(pc, {&sCr, &rCr, &lCr, &cCr}, chroma_steps);
+	// Both chroma passes read the one interleaved source; comp selects Cb/Cr.
+	vkc.run_wavefront(pc, {&sChroma, &rCb, &lCb, &cCb}, wavefront_steps(cw2, ch2, qc, bw, bh, ew2, eh2, 0));
+	vkc.run_wavefront(pc, {&sChroma, &rCr, &lCr, &cCr}, wavefront_steps(cw2, ch2, qc, bw, bh, ew2, eh2, 1));
 	auto t3 = clk::now();
 
 	bs.mode.assign(nb, 1); // DC

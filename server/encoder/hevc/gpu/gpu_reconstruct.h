@@ -39,11 +39,12 @@ class reconstructor
 	bool ready = false;
 
 	int alloc_cw = 0, alloc_ch = 0;
-	vk_compute::buffer sY{}, rY{}, lY{}, cY{};
-	vk_compute::buffer sCb{}, rCb{}, lCb{}, cCb{};
-	vk_compute::buffer sCr{}, rCr{}, lCr{}, cCr{};
+	vk_compute::buffer sY{}, rY{}, lY{}, cY{}; // sY: raw uint8 luma (extent)
+	vk_compute::buffer sChroma{};              // raw uint8 CbCr interleaved (extent)
+	vk_compute::buffer rCb{}, lCb{}, cCb{};
+	vk_compute::buffer rCr{}, lCr{}, cCr{};
 
-	void ensure_buffers(int cw, int ch);
+	void ensure_buffers(int cw, int ch, int ew, int eh);
 
 public:
 	// Wall-clock breakdown of the last reconstruct() call, in microseconds.
@@ -64,11 +65,15 @@ public:
 	// Offline testing: create an own device and load the two shaders from files.
 	void init_own(const char * luma_spv_path, const char * chroma_spv_path);
 
-	// Fill bs (levels/cbf, all-DC modes) from the coded-size source planes
-	// (row-major int, luma cw*ch, chroma (cw/2)*(ch/2)). recon planes, if
-	// non-null, receive the GPU reconstruction (coded size, one byte per sample).
+	// Fill bs (levels/cbf, all-DC modes) directly from the raw compositor planes
+	// at extent resolution ew x eh: lumaU8 is the 8-bit Y plane (ew*eh, stride ew),
+	// chromaU8 is the 8-bit interleaved CbCr plane (ew*eh/2, i.e. (ew/2)*(eh/2)
+	// pairs). The shaders edge-clamp-sample these up to the coded size, so no CPU
+	// padding/de-interleaving is needed. recon planes, if non-null, receive the GPU
+	// reconstruction (coded size, one byte per sample).
 	void reconstruct(const hevc_config & cfg,
-	                 const int32_t * srcY, const int32_t * srcCb, const int32_t * srcCr,
+	                 int ew, int eh,
+	                 const uint8_t * lumaU8, const uint8_t * chromaU8,
 	                 block_syntax & bs,
 	                 uint8_t * recY = nullptr, uint8_t * recCb = nullptr, uint8_t * recCr = nullptr);
 };
