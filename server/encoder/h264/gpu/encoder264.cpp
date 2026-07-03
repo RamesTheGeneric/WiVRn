@@ -32,7 +32,7 @@ namespace
 #pragma pack(push, 1)
 struct RPC { uint32_t mbw, mbh; int32_t qp, qpc; uint32_t cw, ch, ew, eh, diag, mbx_start; };
 struct EPC { uint32_t mbw, mbh, stride_words, lgw, cgw, cgh; };
-struct PPC { uint32_t nmb; };
+struct PPC { uint32_t nmb, base_bits; };
 struct SPC { uint32_t nmb, stride_words; };
 #pragma pack(pop)
 } // namespace
@@ -108,7 +108,7 @@ std::vector<uint8_t> encoder::encode_frame(const h264_config & cfg, int ew, int 
 	std::memcpy(sChroma.ptr, chromaU8, (size_t)ew * eh / 2);
 
 	auto t1 = clk::now();
-	// reconstruction wavefront
+	// reconstruction wavefront steps (anti-diagonal)
 	std::vector<vk_compute::buffer *> rbind = {&sY, &sChroma, &rY, &rCb, &rCr, &lDC, &lAC, &cDC, &cAC, &nnzL, &nnzC};
 	std::vector<vk_compute::step> rsteps;
 	for (int d = 0; d <= mbw + mbh - 2; ++d)
@@ -118,38 +118,52 @@ std::vector<uint8_t> encoder::encode_frame(const h264_config & cfg, int ew, int 
 		vk_compute::step st; st.gx = (uint32_t)(e - s + 1); st.gy = 1; st.gz = 1;
 		st.push.resize(sizeof(pc)); std::memcpy(st.push.data(), &pc, sizeof(pc)); rsteps.push_back(std::move(st));
 	}
-	vkc.run_wavefront(recon, rbind, rsteps);
+
+	// Build the slice header (tiny) up front to get its exact bit length, which the
+	// prefix uses as the payload's base bit offset so the stitch lays the payload
+	// down right after the header — no CPU bit-append of the payload.
+	bitwriter hdr;
+	write_slice_header(hdr, cfg, 0, 0);
+	const uint32_t hbits = (uint32_t)hdr.bit_count();  // exact header bit length (not byte-aligned)
+	const std::vector<uint8_t> hbytes = hdr.bytes();   // header bits MSB-first, last byte zero-padded
+
+	// One command buffer: clear output, recon wavefront, then CAVLC emit -> prefix
+	// -> stitch, with compute barriers between stages. Single submit + fence wait.
+	const EPC epc{(uint32_t)mbw, (uint32_t)mbh, stride_words, (uint32_t)(cw / 4), (uint32_t)(cw / 8), (uint32_t)(ch / 8)};
+	const PPC ppc{(uint32_t)nmb, hbits};
+	const SPC spc{(uint32_t)nmb, stride_words};
+	const uint32_t groups = (uint32_t)((nmb + 63) / 64);
+	auto b = vkc.begin_batch();
+	vkc.record_fill(b, outbits, (size_t)nmb * stride_words * 4, 0);
+	vkc.record_wavefront(b, recon, rbind, rsteps, /*leading_barrier=*/false);
+	vkc.record_dispatch(b, emit, {&lDC, &lAC, &cDC, &cAC, &nnzL, &nnzC, &scratch, &bitLen}, groups, 1, 1, &epc, sizeof(epc), true);
+	vkc.record_dispatch(b, prefix, {&bitLen, &offset, &total}, 1, 1, 1, &ppc, sizeof(ppc), true);
+	vkc.record_dispatch(b, stitch, {&scratch, &bitLen, &offset, &outbits}, groups, 1, 1, &spc, sizeof(spc), true);
+	vkc.submit_and_wait(b);
+	const uint32_t totbits = ((const uint32_t *)total.ptr)[0]; // header + payload bits
 
 	auto t2 = clk::now();
-	// parallel CAVLC: emit -> prefix -> stitch
-	EPC epc{(uint32_t)mbw, (uint32_t)mbh, stride_words, (uint32_t)(cw / 4), (uint32_t)(cw / 8), (uint32_t)(ch / 8)};
-	vkc.run(emit, {&lDC, &lAC, &cDC, &cAC, &nnzL, &nnzC, &scratch, &bitLen}, (uint32_t)((nmb + 63) / 64), 1, 1, &epc, sizeof(epc));
-	PPC ppc{(uint32_t)nmb};
-	vkc.run(prefix, {&bitLen, &offset, &total}, 1, 1, 1, &ppc, sizeof(ppc));
-	const uint32_t totbits = ((const uint32_t *)total.ptr)[0];
-	std::memset(outbits.ptr, 0, ((size_t)(totbits / 32) + 2) * 4);
-	SPC spc{(uint32_t)nmb, stride_words};
-	vkc.run(stitch, {&scratch, &bitLen, &offset, &outbits}, (uint32_t)((nmb + 63) / 64), 1, 1, &spc, sizeof(spc));
+	auto t3 = t2; // CAVLC merged into the single GPU submit
 
-	auto t3 = clk::now();
-	// CPU assembly: slice header + stitched MB bits + trailing + NAL framing.
-	bitwriter w;
-	write_slice_header(w, cfg, 0, 0);
-	const uint32_t * ow = (const uint32_t *)outbits.ptr;
-	const size_t fullbytes = totbits / 8;
-	for (size_t i = 0; i < fullbytes; ++i)
-		w.put_bits((ow[i >> 2] >> (24 - 8 * (i & 3))) & 0xffu, 8);
-	const int rem = int(totbits & 7);
-	if (rem)
-	{
-		const size_t i = fullbytes;
-		const uint32_t b = (ow[i >> 2] >> (24 - 8 * (i & 3))) & 0xffu;
-		w.put_bits(b >> (8 - rem), rem);
-	}
-	w.rbsp_trailing_bits();
+	// The GPU cleared outbits and stitched the payload at bit offset hbits; bits
+	// [0, hbits) are zero. Seed the header bits there (MSB-first) on the CPU (tiny),
+	// then the rbsp_trailing stop bit at `totbits`, and extract RBSP bytes.
+	uint32_t * ow = (uint32_t *)outbits.ptr;
+	auto set_bit = [&](uint32_t pos, uint32_t bit) {
+		if (bit)
+			ow[pos >> 5] |= (0x80000000u >> (pos & 31));
+	};
+	for (uint32_t i = 0; i < hbits; ++i)
+		set_bit(i, (hbytes[i >> 3] >> (7 - (i & 7))) & 1u);
+	set_bit(totbits, 1); // rbsp_trailing_bits stop bit; remaining bits already zero
+
+	const size_t rbsp_bytes = (size_t)(totbits + 1 + 7) / 8;
+	std::vector<uint8_t> rbsp(rbsp_bytes);
+	for (size_t i = 0; i < rbsp_bytes; ++i)
+		rbsp[i] = (uint8_t)((ow[i >> 2] >> (24 - 8 * (i & 3))) & 0xffu);
 
 	std::vector<uint8_t> frame = build_parameter_sets(cfg);
-	emit_nal(frame, 3, NAL_SLICE_IDR, w.bytes());
+	emit_nal(frame, 3, NAL_SLICE_IDR, rbsp);
 
 	auto copy_rec = [](uint8_t * dst, const vk_compute::buffer & b, size_t n) {
 		if (!dst) return;
@@ -160,6 +174,7 @@ std::vector<uint8_t> encoder::encode_frame(const h264_config & cfg, int ew, int 
 	copy_rec(recCb, rCb, (size_t)cw2 * ch2);
 	copy_rec(recCr, rCr, (size_t)cw2 * ch2);
 
+	// up = upload; recon_us = whole GPU batch (recon + CAVLC); cavlc_us folded in; asm = CPU.
 	last_timings = {us(t0, t1), us(t1, t2), us(t2, t3), us(t3, clk::now())};
 	return frame;
 }

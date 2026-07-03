@@ -8,11 +8,14 @@ layout(set = 0, binding = 0, std430) readonly buffer BitLen { uint v[]; } bitLen
 layout(set = 0, binding = 1, std430) writeonly buffer Offset { uint v[]; } offset; // [nmb]
 layout(set = 0, binding = 2, std430) writeonly buffer Total { uint v[]; } total;   // [1] total bits
 
-layout(push_constant) uniform PC { uint nmb; } pc;
+// base_bits = slice-header bit length, so the payload is placed after the header
+// (the CPU seeds the header bits into the front of the output; the stitch writes
+// the MB payload at absolute bit offsets starting at base_bits).
+layout(push_constant) uniform PC { uint nmb; uint base_bits; } pc;
 
 void main()
 {
-	uint acc = 0u;
+	uint acc = pc.base_bits;
 	for (uint i = 0u; i < pc.nmb; ++i) { offset.v[i] = acc; acc += bitLen.v[i]; }
-	total.v[0] = acc;
+	total.v[0] = acc; // = base_bits + sum(bitLen) = total slice-data bits
 }

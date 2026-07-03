@@ -200,7 +200,7 @@ public:
 		b.size = bytes;
 		VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
 		bci.size = bytes;
-		bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+		bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 		bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 		vkcheck(vkCreateBuffer(dev, &bci, nullptr, &b.buf), "vkCreateBuffer");
 		VkMemoryRequirements req;
@@ -420,6 +420,126 @@ public:
 		vkcheck(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX), "waitFence");
 		vkDestroyFence(dev, fence, nullptr);
 		vkFreeCommandBuffers(dev, pool, 1, &cmd);
+	}
+
+	// --- Batched recording: record several dispatch groups (and buffer clears)
+	// into ONE command buffer, then submit once. Each pipeline's descriptor set
+	// is updated once per batch, so a pipeline must be used with a single set of
+	// bindings within a batch (true for the encoder's stages). Blocking submit,
+	// so the reused per-pipeline set is safe across frames. ---
+	struct batch
+	{
+		VkCommandBuffer cmd = VK_NULL_HANDLE;
+	};
+
+private:
+	void bind_set(pipeline & p, const std::vector<buffer *> & bindings)
+	{
+		std::vector<VkDescriptorBufferInfo> infos(bindings.size());
+		std::vector<VkWriteDescriptorSet> writes(bindings.size());
+		for (size_t i = 0; i < bindings.size(); ++i)
+		{
+			infos[i] = {bindings[i]->buf, 0, VK_WHOLE_SIZE};
+			writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+			writes[i].dstSet = p.dset;
+			writes[i].dstBinding = (uint32_t)i;
+			writes[i].descriptorCount = 1;
+			writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			writes[i].pBufferInfo = &infos[i];
+		}
+		vkUpdateDescriptorSets(dev, (uint32_t)writes.size(), writes.data(), 0, nullptr);
+	}
+	void compute_barrier(VkCommandBuffer cmd)
+	{
+		VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+		mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     0, 1, &mb, 0, nullptr, 0, nullptr);
+	}
+
+public:
+	batch begin_batch()
+	{
+		batch b;
+		VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+		cbai.commandPool = pool;
+		cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+		cbai.commandBufferCount = 1;
+		vkcheck(vkAllocateCommandBuffers(dev, &cbai, &b.cmd), "allocCmd");
+		VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+		bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		vkBeginCommandBuffer(b.cmd, &bi);
+		return b;
+	}
+
+	// Zero a buffer on the GPU, then a TRANSFER->COMPUTE barrier so later dispatches see it.
+	void record_fill(batch & b, buffer & buf, size_t bytes, uint32_t value = 0)
+	{
+		vkCmdFillBuffer(b.cmd, buf.buf, 0, bytes, value);
+		VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+		mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+		vkCmdPipelineBarrier(b.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     0, 1, &mb, 0, nullptr, 0, nullptr);
+	}
+
+	void record_wavefront(batch & b, pipeline & p, const std::vector<buffer *> & bindings,
+	                      const std::vector<step> & steps, bool leading_barrier)
+	{
+		bind_set(p, bindings);
+		if (leading_barrier)
+			compute_barrier(b.cmd);
+		vkCmdBindPipeline(b.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
+		vkCmdBindDescriptorSets(b.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &p.dset, 0, nullptr);
+		for (size_t s = 0; s < steps.size(); ++s)
+		{
+			if (s > 0)
+				compute_barrier(b.cmd);
+			if (!steps[s].push.empty())
+				vkCmdPushConstants(b.cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)steps[s].push.size(), steps[s].push.data());
+			vkCmdDispatch(b.cmd, steps[s].gx, steps[s].gy, steps[s].gz);
+		}
+	}
+
+	void record_dispatch(batch & b, pipeline & p, const std::vector<buffer *> & bindings,
+	                     uint32_t gx, uint32_t gy, uint32_t gz, const void * push, int push_bytes, bool leading_barrier)
+	{
+		bind_set(p, bindings);
+		if (leading_barrier)
+			compute_barrier(b.cmd);
+		vkCmdBindPipeline(b.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
+		vkCmdBindDescriptorSets(b.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &p.dset, 0, nullptr);
+		if (push && push_bytes > 0)
+			vkCmdPushConstants(b.cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes, push);
+		vkCmdDispatch(b.cmd, gx, gy, gz);
+	}
+
+	// End, submit, wait, free. Optionally wait on a timeline semaphore value first.
+	void submit_and_wait(batch & b, VkSemaphore wait_sem = VK_NULL_HANDLE, uint64_t wait_value = 0)
+	{
+		vkEndCommandBuffer(b.cmd);
+		VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+		VkFence fence;
+		vkCreateFence(dev, &fci, nullptr, &fence);
+		VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+		si.commandBufferCount = 1;
+		si.pCommandBuffers = &b.cmd;
+		VkTimelineSemaphoreSubmitInfo tsi{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+		VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+		if (wait_sem != VK_NULL_HANDLE)
+		{
+			si.waitSemaphoreCount = 1;
+			si.pWaitSemaphores = &wait_sem;
+			si.pWaitDstStageMask = &wait_stage;
+			tsi.waitSemaphoreValueCount = 1;
+			tsi.pWaitSemaphoreValues = &wait_value;
+			si.pNext = &tsi;
+		}
+		vkcheck(vkQueueSubmit(queue, 1, &si, fence), "queueSubmit");
+		vkcheck(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX), "waitFence");
+		vkDestroyFence(dev, fence, nullptr);
+		vkFreeCommandBuffers(dev, pool, 1, &b.cmd);
 	}
 };
 
