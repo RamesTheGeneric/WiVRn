@@ -23,7 +23,7 @@ struct PC
 {
 	uint32_t mbw, mbh;
 	int32_t qp, qpc;
-	uint32_t cw, ch, ew, eh, diag, mbx_start;
+	uint32_t cw, ch, ew, eh, nmb;
 };
 
 int main(int argc, char ** argv)
@@ -31,7 +31,7 @@ int main(int argc, char ** argv)
 	const char * spv = argc > 1 ? argv[1] : "/tmp/r264.spv";
 	vk_compute vk;
 	vk.init();
-	auto pipe = vk.make_pipeline(spv, 11, sizeof(PC));
+	auto pipe = vk.make_pipeline(spv, 14, sizeof(PC));
 
 	int fails = 0;
 	struct tc { int w, h, qp; };
@@ -81,17 +81,23 @@ int main(int argc, char ** argv)
 			}
 		}
 
-		std::vector<vk_compute::buffer *> binds = {&bSY, &bSC, &bRY, &bRCb, &bRCr, &bLDC, &bLAC, &bCDC, &bCAC, &bNL, &bNC};
-		std::vector<vk_compute::step> steps;
-		const int qpc = wivrn::avc::xform::chroma_qp(t.qp);
-		for (int d = 0; d <= mbw + mbh - 2; ++d) {
-			int s = std::max(0, d - (mbh - 1)), e = std::min(d, mbw - 1);
-			PC pc{(uint32_t)mbw, (uint32_t)mbh, t.qp, qpc, (uint32_t)cw, (uint32_t)ch, (uint32_t)ew, (uint32_t)eh, (uint32_t)d, (uint32_t)s};
-			vk_compute::step st; st.gx = (uint32_t)(e - s + 1); st.gy = 1; st.gz = 1;
-			st.push.resize(sizeof(pc)); memcpy(st.push.data(), &pc, sizeof(pc));
-			steps.push_back(std::move(st));
+		// scoreboard: anti-diagonal MB order + claim counter + done flags
+		auto bOrd = vk.make_buffer((size_t)nmb * 4);
+		auto bClaim = vk.make_buffer(4, true);
+		auto bDone = vk.make_buffer((size_t)nmb * 4, true);
+		{
+			auto * ord = (uint32_t *)bOrd.ptr;
+			uint32_t k = 0;
+			for (int d = 0; d <= mbw + mbh - 2; ++d)
+				for (int mbx = std::max(0, d - (mbh - 1)); mbx <= std::min(d, mbw - 1); ++mbx)
+					ord[k++] = uint32_t((d - mbx) * mbw + mbx);
+			memset(bClaim.ptr, 0, 4);
+			memset(bDone.ptr, 0, (size_t)nmb * 4);
 		}
-		vk.run_wavefront(pipe, binds, steps);
+		std::vector<vk_compute::buffer *> binds = {&bSY, &bSC, &bRY, &bRCb, &bRCr, &bLDC, &bLAC, &bCDC, &bCAC, &bNL, &bNC, &bOrd, &bClaim, &bDone};
+		const int qpc = wivrn::avc::xform::chroma_qp(t.qp);
+		PC pc{(uint32_t)mbw, (uint32_t)mbh, t.qp, qpc, (uint32_t)cw, (uint32_t)ch, (uint32_t)ew, (uint32_t)eh, (uint32_t)nmb};
+		vk.run(pipe, binds, std::min(nmb, 64), 1, 1, &pc, sizeof(pc));
 
 		int mism = 0;
 		auto * gY = (int32_t *)bRY.ptr; auto * gCb = (int32_t *)bRCb.ptr; auto * gCr = (int32_t *)bRCr.ptr;

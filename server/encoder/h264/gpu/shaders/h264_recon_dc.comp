@@ -1,30 +1,46 @@
 #version 460
-// H.264 I_16x16 DC reconstruction, one workgroup per macroblock on an
-// anti-diagonal (MB (mbx,mby) depends only on the left and top MBs' recon, so a
-// diagonal sweep matches decode-order availability). Bit-exact port of
+// H.264 I_16x16 DC reconstruction — SCOREBOARD variant. A single dispatch of N
+// persistent workgroups; each atomically claims the next macroblock in
+// anti-diagonal (dependency) order (mbOrder) and spins on its left/top
+// neighbours' per-MB done-flag before coding, so all cross-MB dependencies are
+// honoured in one dispatch instead of ~99 pipeline barriers. Bit-exact port of
 // cpu_encoder264: DC intra prediction from reconstructed MB neighbours, 4x4
 // forward transform + quant, luma/chroma Hadamard DC, then inverse to recon,
 // emitting per-4x4-block levels + nnz for the CAVLC stage.
+//
+// Cross-workgroup sync uses the Vulkan memory model: device-scoped atomic
+// RELEASE on a neighbour's done flag (paired with the recon writes) and
+// device-scoped atomic ACQUIRE when spinning on it. This is a real happens-
+// before edge, unlike legacy `coherent` + memoryBarrierBuffer() (which is
+// underspecified for cross-workgroup ordering and raced under contention).
+#extension GL_KHR_memory_scope_semantics : require
 layout(local_size_x = 32) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer SrcY { uint v[]; } srcY;   // packed u8 luma (ew*eh)
 layout(set = 0, binding = 1, std430) readonly buffer SrcC { uint v[]; } srcC;   // packed u8 interleaved CbCr
-layout(set = 0, binding = 2, std430) buffer RecY { int v[]; } recY;             // coded cw*ch
-layout(set = 0, binding = 3, std430) buffer RecCb { int v[]; } recCb;
-layout(set = 0, binding = 4, std430) buffer RecCr { int v[]; } recCr;
+// recon planes are coherent: neighbours' reconstruction is read across
+// workgroups, so each access is made available/visible at device scope.
+layout(set = 0, binding = 2, std430) coherent buffer RecY { int v[]; } recY;    // coded cw*ch
+layout(set = 0, binding = 3, std430) coherent buffer RecCb { int v[]; } recCb;
+layout(set = 0, binding = 4, std430) coherent buffer RecCr { int v[]; } recCr;
 layout(set = 0, binding = 5, std430) writeonly buffer OutLDC { int v[]; } outLDC;   // [nmb*16]
 layout(set = 0, binding = 6, std430) buffer OutLAC { int v[]; } outLAC;   // [nmb*16*16] (recon reads back)
 layout(set = 0, binding = 7, std430) writeonly buffer OutCDC { int v[]; } outCDC;   // [nmb*2*4]
 layout(set = 0, binding = 8, std430) buffer OutCAC { int v[]; } outCAC;   // [nmb*2*4*16] (recon reads back)
 layout(set = 0, binding = 9, std430) writeonly buffer OutNL { uint v[]; } outNL;    // global luma 4x4 nnz grid [lgw*lgh]
 layout(set = 0, binding = 10, std430) writeonly buffer OutNC { uint v[]; } outNC;   // global chroma 4x4 nnz grid [2*cgw*cgh]
+// Scoreboard state: MB raster indices in anti-diagonal order, an atomic claim
+// counter, and one done flag per MB (0 = not yet reconstructed, 1 = published).
+layout(set = 0, binding = 11, std430) readonly buffer MbOrder { uint v[]; } mbOrder; // [nmb]
+layout(set = 0, binding = 12, std430) coherent buffer Claim { uint v[]; } claim;      // [1] atomic counter
+layout(set = 0, binding = 13, std430) coherent buffer Done { uint v[]; } done;         // [nmb] atomic 0/1
 
 layout(push_constant) uniform PC {
 	uint mbw, mbh;
 	int qp, qpc;
 	uint cw, ch;   // coded luma dims
 	uint ew, eh;   // extent (source) luma dims
-	uint diag, mbx_start;
+	uint nmb;
 } pc;
 
 const int MF[6][3] = int[6][3](int[3](13107, 5243, 8066), int[3](11916, 4660, 7490), int[3](10082, 4194, 6554),
@@ -114,19 +130,33 @@ shared int dcYCb[4];
 shared int dcYCr[4];
 shared uint mbx_s, mby_s;
 shared bool availL_s, availT_s;
+shared uint s_idx;
 
 void main()
 {
 	uint t = gl_LocalInvocationID.x;
+	while (true) {
+	// claim the next macroblock in anti-diagonal order
+	if (t == 0u)
+		s_idx = atomicAdd(claim.v[0], 1u);
+	barrier();
+	uint idx = s_idx;
+	if (idx >= pc.nmb) return; // uniform across the workgroup: all lanes exit together
 	if (t == 0u) {
-		uint bx = pc.mbx_start + gl_WorkGroupID.x;
-		uint by = pc.diag - bx;
-		mbx_s = bx; mby_s = by;
-		availL_s = bx > 0u; availT_s = by > 0u;
+		uint mb = mbOrder.v[idx];
+		uint mx = mb % pc.mbw, my = mb / pc.mbw;
+		mbx_s = mx; mby_s = my;
+		availL_s = mx > 0u; availT_s = my > 0u;
+		// device-scoped ACQUIRE: spin until each needed neighbour has published
+		// its reconstruction. The matching RELEASE (below) makes that MB's recon
+		// writes happen-before this load observing done == 1.
+		if (mx > 0u)
+			while (atomicLoad(done.v[mb - 1u], gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquire) == 0u) {}
+		if (my > 0u)
+			while (atomicLoad(done.v[mb - pc.mbw], gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquire) == 0u) {}
 	}
 	barrier();
 	uint mbx = mbx_s, mby = mby_s;
-	if (mbx >= pc.mbw || mby >= pc.mbh) return;
 	int px = int(mbx) * 16, py = int(mby) * 16;
 	int cw = int(pc.cw), ch = int(pc.ch), cw2 = cw / 2, ch2 = ch / 2;
 	int cpx = int(mbx) * 8, cpy = int(mby) * 8;
@@ -285,4 +315,12 @@ void main()
 			else recCr.v[(cpy + sby + r) * cw2 + (cpx + sbx + c)] = val;
 		}
 	}
+
+	// All lanes have written this MB's reconstruction (coherent -> device
+	// available). Sync the workgroup, then thread 0 publishes the done flag with
+	// a device-scoped RELEASE so a neighbour acquiring it sees the recon writes.
+	barrier();
+	if (t == 0u)
+		atomicStore(done.v[mby * pc.mbw + mbx], 1u, gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsRelease);
+	} // end claim loop
 }

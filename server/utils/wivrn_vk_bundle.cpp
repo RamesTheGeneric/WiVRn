@@ -341,6 +341,10 @@ wivrn::vk_bundle::vk_bundle() :
 
 		std::get<vk::PhysicalDeviceVulkan12Features>(feat).descriptorBindingPartiallyBound = phys_feat12.descriptorBindingPartiallyBound;
 		std::get<vk::PhysicalDeviceVulkan12Features>(feat).timelineSemaphore = phys_feat12.timelineSemaphore;
+		// Device-scoped Vulkan memory model: required by the H.264 GPU encoder's
+		// scoreboard reconstruction (cross-workgroup atomic acquire/release).
+		std::get<vk::PhysicalDeviceVulkan12Features>(feat).vulkanMemoryModel = phys_feat12.vulkanMemoryModel;
+		std::get<vk::PhysicalDeviceVulkan12Features>(feat).vulkanMemoryModelDeviceScope = phys_feat12.vulkanMemoryModelDeviceScope;
 		std::get<vk::PhysicalDeviceVulkan13Features>(feat).synchronization2 = phys_feat13.synchronization2;
 
 		if (not phys_feat13.synchronization2)

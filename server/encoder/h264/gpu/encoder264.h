@@ -44,6 +44,8 @@ class encoder
 	vk_compute::buffer rY{}, rCb{}, rCr{};
 	vk_compute::buffer lDC{}, lAC{}, cDC{}, cAC{}, nnzL{}, nnzC{};
 	vk_compute::buffer scratch{}, bitLen{}, offset{}, total{}, outbits{};
+	// Scoreboard reconstruction: anti-diagonal MB order + claim counter + done flags.
+	vk_compute::buffer mbOrder{}, claim{}, doneBuf{};
 	uint32_t stride_words = 256;
 
 	void ensure_buffers(const h264_config & cfg, int ew, int eh);
