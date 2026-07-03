@@ -1,0 +1,32 @@
+#version 460
+// Parallel bit-concatenation: each invocation copies its MB's CAVLC bit string
+// (MSB-first packed in the per-MB scratch) to the global output at the MB's bit
+// offset, word by word, merging boundary words with atomicOr. The output buffer
+// must be zero-initialised before dispatch.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Scratch { uint v[]; } scratch; // [nmb*stride_words]
+layout(set = 0, binding = 1, std430) readonly buffer BitLen { uint v[]; } bitLen;   // [nmb]
+layout(set = 0, binding = 2, std430) readonly buffer Offset { uint v[]; } offset;   // [nmb]
+layout(set = 0, binding = 3, std430) buffer Out { uint v[]; } outb;                 // zeroed, MSB-first words
+
+layout(push_constant) uniform PC { uint nmb, stride_words; } pc;
+
+void main()
+{
+	uint mb = gl_GlobalInvocationID.x;
+	if (mb >= pc.nmb) return;
+	uint L = bitLen.v[mb];
+	uint obit = offset.v[mb];
+	uint sbase = mb * pc.stride_words;
+	uint nwords = (L + 31u) / 32u;
+	for (uint si = 0u; si < nwords; ++si) {
+		uint val = scratch.v[sbase + si]; // 32 bits, first bit at MSB
+		uint dbit = obit + si * 32u;
+		uint w0 = dbit >> 5u;
+		uint sh = dbit & 31u;
+		atomicOr(outb.v[w0], val >> sh);
+		if (sh != 0u)
+			atomicOr(outb.v[w0 + 1u], val << (32u - sh));
+	}
+}

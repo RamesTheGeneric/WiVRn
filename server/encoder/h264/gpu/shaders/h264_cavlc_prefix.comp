@@ -1,0 +1,18 @@
+#version 460
+// Prefix-sum of per-MB CAVLC bit lengths -> per-MB starting bit offset, plus the
+// total bit count. Single workgroup, one thread (nmb <= a few thousand; this is a
+// tiny serial scan compared to the parallel emit/stitch).
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BitLen { uint v[]; } bitLen; // [nmb]
+layout(set = 0, binding = 1, std430) writeonly buffer Offset { uint v[]; } offset; // [nmb]
+layout(set = 0, binding = 2, std430) writeonly buffer Total { uint v[]; } total;   // [1] total bits
+
+layout(push_constant) uniform PC { uint nmb; } pc;
+
+void main()
+{
+	uint acc = 0u;
+	for (uint i = 0u; i < pc.nmb; ++i) { offset.v[i] = acc; acc += bitLen.v[i]; }
+	total.v[0] = acc;
+}

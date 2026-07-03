@@ -1,0 +1,217 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Parallel CAVLC emit (PyroWave-style): one invocation per macroblock writes its
+// complete CAVLC bit string into a per-MB scratch region and records its bit
+// length. CAVLC has no serial cross-MB bitstream state — the nC contexts come
+// from the neighbours' coefficient COUNTS (the nnz grid from the recon pass) —
+// so every MB is independent. A later prefix-sum + stitch concatenates them.
+// Faithful port of cpu_encoder264's per-MB syntax + cavlc.cpp residual_block.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer LDC { int v[]; } ldc;   // [nmb*16]
+layout(set = 0, binding = 1, std430) readonly buffer LAC { int v[]; } lac;   // [nmb*256]
+layout(set = 0, binding = 2, std430) readonly buffer CDC { int v[]; } cdc;   // [nmb*8]
+layout(set = 0, binding = 3, std430) readonly buffer CAC { int v[]; } cac;   // [nmb*128]
+layout(set = 0, binding = 4, std430) readonly buffer NNZL { uint v[]; } nnzL; // global luma 4x4 grid
+layout(set = 0, binding = 5, std430) readonly buffer NNZC { uint v[]; } nnzC; // global chroma 4x4 grid [2*cgw*cgh]
+layout(set = 0, binding = 6, std430) buffer Scratch { uint v[]; } scratch;    // [nmb*stride_words]
+layout(set = 0, binding = 7, std430) writeonly buffer BitLen { uint v[]; } bitLen; // [nmb]
+
+layout(push_constant) uniform PC {
+	uint mbw, mbh;
+	uint stride_words;
+	uint lgw, cgw, cgh; // luma grid width, chroma grid width/height
+} pc;
+
+#include "cavlc_tables.glsl.inc"
+
+const int zblk_bx[16] = int[16](0, 1, 0, 1, 2, 3, 2, 3, 0, 1, 0, 1, 2, 3, 2, 3);
+const int zblk_by[16] = int[16](0, 0, 1, 1, 0, 0, 1, 1, 2, 2, 3, 3, 2, 2, 3, 3);
+
+// ---- per-invocation bit writer ----
+uint wbase;   // scratch word base for this MB
+uint wcur;    // current word accumulator (MSB-first)
+int wn;       // bits in wcur
+uint wword;   // next word index within the MB region
+uint wbits;   // total bits written
+
+void put_bit(uint b)
+{
+	wcur = (wcur << 1) | (b & 1u);
+	++wbits;
+	if (++wn == 32) { scratch.v[wbase + wword] = wcur; ++wword; wcur = 0u; wn = 0; }
+}
+void put_bits(uint v, int n) { for (int i = n - 1; i >= 0; --i) put_bit((v >> uint(i)) & 1u); }
+void flush() { if (wn > 0) { scratch.v[wbase + wword] = wcur << uint(32 - wn); ++wword; wcur = 0u; wn = 0; } }
+
+void put_ue(uint v)
+{
+	uint code = v + 1u;
+	int n = 0; uint t = code; while (t > 1u) { t >>= 1u; ++n; }
+	for (int i = 0; i < n; ++i) put_bit(0u);
+	put_bits(code, n + 1);
+}
+void put_se(int v)
+{
+	uint k = (v <= 0) ? uint(-2 * v) : uint(2 * v - 1);
+	put_ue(k);
+}
+
+// ---- residual_block (port of cavlc.cpp) ----
+void write_coeff_token(int total, int t1, int nC, bool chroma_dc)
+{
+	int idx = total * 4 + t1;
+	if (chroma_dc) { put_bits(cdc_ctk_bits[idx], int(cdc_ctk_len[idx])); return; }
+	int tb = nC < 2 ? 0 : (nC < 4 ? 1 : (nC < 8 ? 2 : 3));
+	put_bits(ctk_bits[tb * 68 + idx], int(ctk_len[tb * 68 + idx]));
+}
+void write_level(int level_code, int sl)
+{
+	int prefix, suffix = 0, ssize = 0;
+	if (sl == 0) {
+		if (level_code < 14) prefix = level_code;
+		else if (level_code < 30) { prefix = 14; suffix = level_code - 14; ssize = 4; }
+		else { prefix = 15; suffix = level_code - 30; ssize = 12; }
+	} else {
+		prefix = level_code >> sl;
+		if (prefix < 15) { suffix = level_code & ((1 << sl) - 1); ssize = sl; }
+		else { prefix = 15; suffix = level_code - (15 << sl); ssize = 12; }
+	}
+	for (int i = 0; i < prefix; ++i) put_bit(0u);
+	put_bit(1u);
+	if (ssize > 0) put_bits(uint(suffix), ssize);
+}
+
+// levels are read via an accessor: which=0 LDC, 1 LAC, 2 CDC, 3 CAC.
+int g_which; uint g_base; // base index into the chosen buffer
+int lev(int scanRaster)
+{
+	if (g_which == 0) return ldc.v[g_base + uint(scanRaster)];
+	if (g_which == 1) return lac.v[g_base + uint(scanRaster)];
+	if (g_which == 2) return cdc.v[g_base + uint(scanRaster)];
+	return cac.v[g_base + uint(scanRaster)];
+}
+
+// scanMap: for count==16 (luma DC) scanRaster=zigzag4[s]; count==15 (AC) =zigzag4[s+1];
+//          count==4 (chroma DC) raster=s.
+void residual_block(int count, int nC, bool chroma_dc, int scankind)
+{
+	int run[16]; int lvl[16];
+	int total = 0, total_zeros = 0, last = -1;
+	for (int s = count - 1; s >= 0; --s) {
+		int r = (scankind == 0) ? int(zigzag4[s]) : (scankind == 1 ? int(zigzag4[s + 1]) : s);
+		if (lev(r) != 0) { last = s; break; }
+	}
+	if (last >= 0) {
+		int run_acc = 0;
+		for (int s = last; s >= 0; --s) {
+			int r = (scankind == 0) ? int(zigzag4[s]) : (scankind == 1 ? int(zigzag4[s + 1]) : s);
+			int val = lev(r);
+			if (val != 0) { lvl[total] = val; if (total >= 1) run[total - 1] = run_acc; ++total; run_acc = 0; }
+			else ++run_acc;
+		}
+		total_zeros = last + 1 - total;
+	}
+	int t1 = 0;
+	while (t1 < total && t1 < 3 && abs(lvl[t1]) == 1) ++t1;
+	write_coeff_token(total, t1, nC, chroma_dc);
+	if (total == 0) return;
+	for (int i = 0; i < t1; ++i) put_bit(lvl[i] < 0 ? 1u : 0u);
+	int sl = (total > 10 && t1 < 3) ? 1 : 0;
+	for (int i = t1; i < total; ++i) {
+		int level = lvl[i];
+		int lc = (level > 0) ? ((level << 1) - 2) : ((-level << 1) - 1);
+		if (i == t1 && t1 < 3) lc -= 2;
+		write_level(lc, sl);
+		if (sl == 0) sl = 1;
+		if (abs(level) > (3 << (sl - 1)) && sl < 6) ++sl;
+	}
+	if (total < count) {
+		if (chroma_dc) put_bits(cdc_tz_bits[(total - 1) * 4 + total_zeros], int(cdc_tz_len[(total - 1) * 4 + total_zeros]));
+		else put_bits(tz_bits[(total - 1) * 16 + total_zeros], int(tz_len[(total - 1) * 16 + total_zeros]));
+	}
+	int zl = total_zeros;
+	for (int i = 0; i < total - 1; ++i) {
+		if (zl <= 0) break;
+		int tk = (zl < 7 ? zl : 7) - 1;
+		put_bits(run_bits[tk * 16 + run[i]], int(run_len[tk * 16 + run[i]]));
+		zl -= run[i];
+	}
+}
+
+int nC_luma(int gx, int gy)
+{
+	bool a = gx > 0, b = gy > 0;
+	int nA = a ? int(nnzL.v[uint(gy) * pc.lgw + uint(gx - 1)]) : 0;
+	int nB = b ? int(nnzL.v[uint(gy - 1) * pc.lgw + uint(gx)]) : 0;
+	if (a && b) return (nA + nB + 1) >> 1;
+	if (a) return nA;
+	if (b) return nB;
+	return 0;
+}
+int nC_chroma(int comp, int gx, int gy)
+{
+	uint base = uint(comp) * (pc.cgw * pc.cgh);
+	bool a = gx > 0, b = gy > 0;
+	int nA = a ? int(nnzC.v[base + uint(gy) * pc.cgw + uint(gx - 1)]) : 0;
+	int nB = b ? int(nnzC.v[base + uint(gy - 1) * pc.cgw + uint(gx)]) : 0;
+	if (a && b) return (nA + nB + 1) >> 1;
+	if (a) return nA;
+	if (b) return nB;
+	return 0;
+}
+
+void main()
+{
+	uint mb = gl_GlobalInvocationID.x;
+	uint nmb = pc.mbw * pc.mbh;
+	if (mb >= nmb) return;
+	uint mbx = mb % pc.mbw, mby = mb / pc.mbw;
+	wbase = mb * pc.stride_words; wcur = 0u; wn = 0; wword = 0u; wbits = 0u;
+
+	// cbp
+	bool anyLAC = false;
+	for (int b = 0; b < 16; ++b) for (int k = 1; k < 16; ++k) if (lac.v[mb * 256u + uint(b) * 16u + uint(k)] != 0) anyLAC = true;
+	bool anyCAC = false, anyCDC = false;
+	for (int i = 0; i < 128; ++i) { int bb = i & 15; if (bb != 0 && cac.v[mb * 128u + uint(i)] != 0) anyCAC = true; }
+	for (int i = 0; i < 8; ++i) if (cdc.v[mb * 8u + uint(i)] != 0) anyCDC = true;
+	int cbpLuma = anyLAC ? 15 : 0;
+	int cbpChroma = anyCAC ? 2 : (anyCDC ? 1 : 0);
+	int mb_type = 1 + 2 + 4 * cbpChroma + 12 * ((cbpLuma == 15) ? 1 : 0);
+
+	put_ue(uint(mb_type));
+	put_ue(0u); // intra_chroma_pred_mode = DC
+	put_se(0);  // mb_qp_delta
+
+	// Intra16x16DCLevel (nC = block 0)
+	g_which = 0; g_base = mb * 16u;
+	residual_block(16, nC_luma(int(mbx) * 4, int(mby) * 4), false, 0);
+	// Intra16x16ACLevel
+	if (cbpLuma != 0) {
+		for (int zi = 0; zi < 16; ++zi) {
+			int bx = zblk_bx[zi], by = zblk_by[zi];
+			g_which = 1; g_base = mb * 256u + uint(by * 4 + bx) * 16u;
+			residual_block(15, nC_luma(int(mbx) * 4 + bx, int(mby) * 4 + by), false, 1);
+		}
+	}
+	// Chroma DC (Cb, Cr), nC = -1
+	if ((cbpChroma & 3) != 0) {
+		for (int comp = 0; comp < 2; ++comp) {
+			g_which = 2; g_base = mb * 8u + uint(comp) * 4u;
+			residual_block(4, -1, true, 2);
+		}
+	}
+	// Chroma AC
+	if ((cbpChroma & 2) != 0) {
+		for (int comp = 0; comp < 2; ++comp) {
+			for (int sb = 0; sb < 4; ++sb) {
+				int bx = sb & 1, by = sb >> 1;
+				g_which = 3; g_base = mb * 128u + uint(comp) * 64u + uint(sb) * 16u;
+				residual_block(15, nC_chroma(comp, int(mbx) * 2 + bx, int(mby) * 2 + by), false, 1);
+			}
+		}
+	}
+
+	flush();
+	bitLen.v[mb] = wbits;
+}

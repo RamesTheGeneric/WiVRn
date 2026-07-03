@@ -68,8 +68,8 @@ int main(int argc, char ** argv)
 		auto bLAC = vk.make_buffer((size_t)nmb * 256 * 4, true);
 		auto bCDC = vk.make_buffer((size_t)nmb * 8 * 4, true);
 		auto bCAC = vk.make_buffer((size_t)nmb * 128 * 4, true);
-		auto bNL = vk.make_buffer((size_t)nmb * 16 * 4, true);
-		auto bNC = vk.make_buffer((size_t)nmb * 8 * 4, true);
+		auto bNL = vk.make_buffer((size_t)(cw / 4) * (ch / 4) * 4, true);
+		auto bNC = vk.make_buffer((size_t)2 * (cw / 8) * (ch / 8) * 4, true);
 
 		// pack sources
 		memcpy(bSY.ptr, img.Y.data(), (size_t)ew * eh);

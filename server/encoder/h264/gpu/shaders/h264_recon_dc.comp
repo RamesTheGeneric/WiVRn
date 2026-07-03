@@ -16,8 +16,8 @@ layout(set = 0, binding = 5, std430) writeonly buffer OutLDC { int v[]; } outLDC
 layout(set = 0, binding = 6, std430) buffer OutLAC { int v[]; } outLAC;   // [nmb*16*16] (recon reads back)
 layout(set = 0, binding = 7, std430) writeonly buffer OutCDC { int v[]; } outCDC;   // [nmb*2*4]
 layout(set = 0, binding = 8, std430) buffer OutCAC { int v[]; } outCAC;   // [nmb*2*4*16] (recon reads back)
-layout(set = 0, binding = 9, std430) writeonly buffer OutNL { uint v[]; } outNL;    // [nmb*16]
-layout(set = 0, binding = 10, std430) writeonly buffer OutNC { uint v[]; } outNC;   // [nmb*2*4]
+layout(set = 0, binding = 9, std430) writeonly buffer OutNL { uint v[]; } outNL;    // global luma 4x4 nnz grid [lgw*lgh]
+layout(set = 0, binding = 10, std430) writeonly buffer OutNC { uint v[]; } outNC;   // global chroma 4x4 nnz grid [2*cgw*cgh]
 
 layout(push_constant) uniform PC {
 	uint mbw, mbh;
@@ -187,7 +187,8 @@ void main()
 			outLAC.v[acbase + uint(k)] = lv;
 			if (lv != 0) ++nz;
 		}
-		outNL.v[nmb_idx * 16u + uint(by*4+bx)] = nz;
+		uint lgw = pc.cw / 4u;
+		outNL.v[(mby * 4u + uint(by)) * lgw + (mbx * 4u + uint(bx))] = nz;
 	} else if (t < 24u) {
 		int comp = (t < 20u) ? 0 : 1;
 		int sb = int(t) - (comp == 0 ? 16 : 20);
@@ -206,7 +207,8 @@ void main()
 			outCAC.v[acbase + uint(k)] = lv;
 			if (lv != 0) ++nz;
 		}
-		outNC.v[nmb_idx * 8u + uint(comp) * 4u + uint(sb)] = nz;
+		uint cgw = pc.cw / 8u, cgh = pc.ch / 8u;
+		outNC.v[uint(comp) * (cgw * cgh) + (mby * 2u + uint(sby / 4)) * cgw + (mbx * 2u + uint(sbx / 4))] = nz;
 	}
 	barrier();
 
