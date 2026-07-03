@@ -24,7 +24,7 @@
 #include <array>
 #include <cstring>
 
-namespace wivrn::h264
+namespace wivrn::avc
 {
 
 using namespace xform;
@@ -352,4 +352,4 @@ std::vector<uint8_t> encode_idr_frame(const h264_config & cfg, const yuv_image &
 	return frame;
 }
 
-} // namespace wivrn::h264
+} // namespace wivrn::avc

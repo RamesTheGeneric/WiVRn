@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-using namespace wivrn::h264;
+using namespace wivrn::avc;
 
 int main()
 {

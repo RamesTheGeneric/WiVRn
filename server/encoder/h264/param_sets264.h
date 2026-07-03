@@ -26,7 +26,7 @@
 // H.264 / AVC parameter sets and framing for the shader-based "h2-67" encoder's
 // H.264 path. Constrained Baseline profile, all-IDR I-slices, 4:2:0 8-bit,
 // deblocking off, fixed QP — the CAVLC counterpart of the HEVC MVP.
-namespace wivrn::h264
+namespace wivrn::avc
 {
 
 // Reuse the codec-agnostic RBSP bit writer + emulation prevention from the HEVC
@@ -68,4 +68,4 @@ std::vector<uint8_t> build_parameter_sets(const h264_config & cfg);
 // idc). CAVLC: the slice data follows immediately, NOT byte-aligned.
 void write_slice_header(bitwriter & w, const h264_config & cfg, uint32_t first_mb, uint16_t idr_pic_id);
 
-} // namespace wivrn::h264
+} // namespace wivrn::avc

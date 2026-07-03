@@ -23,7 +23,7 @@
 // spec so our reconstruction equals a conforming decoder's output; the forward
 // (encoder) quant is a standard rounding quantiser. All 4x4/2x2 arrays are
 // row-major.
-namespace wivrn::h264::xform
+namespace wivrn::avc::xform
 {
 
 // Chroma QP from luma QP (Table 8-15, chroma_qp_index_offset = 0).
@@ -51,4 +51,4 @@ void idc_chroma(const int * level, int qpc, int * dcC); // 4 -> 4
 // `dc_override` (the value from idc_luma/idc_chroma) instead of level[0].
 void idct4(const int * level, int qp, bool use_dc, int dc_override, int * resid);
 
-} // namespace wivrn::h264::xform
+} // namespace wivrn::avc::xform

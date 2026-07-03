@@ -23,7 +23,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace wivrn::h264
+namespace wivrn::avc
 {
 
 // Coded-size (CTB/MB-aligned) 8-bit YUV 4:2:0 planes. Chroma is half resolution.
@@ -45,4 +45,4 @@ std::vector<uint8_t> encode_idr_frame(const h264_config & cfg, const yuv_image &
                                       std::vector<uint8_t> * recCb = nullptr,
                                       std::vector<uint8_t> * recCr = nullptr);
 
-} // namespace wivrn::h264
+} // namespace wivrn::avc

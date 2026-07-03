@@ -20,7 +20,7 @@
 
 #include "param_sets264.h"
 
-namespace wivrn::h264
+namespace wivrn::avc
 {
 
 // CAVLC residual_block (Rec. ITU-T H.264 clause 9.2). `levels` holds the block's
@@ -33,4 +33,4 @@ int residual_block(bitwriter & w, const int * levels, int count, int nC, bool ch
 // The 4x4 up-right zig-zag scan (raster index for each scan position).
 extern const int zigzag4x4[16];
 
-} // namespace wivrn::h264
+} // namespace wivrn::avc

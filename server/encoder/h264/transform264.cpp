@@ -20,7 +20,7 @@
 
 #include <cstdlib>
 
-namespace wivrn::h264::xform
+namespace wivrn::avc::xform
 {
 
 namespace
@@ -253,4 +253,4 @@ void idct4(const int * level, int qp, bool use_dc, int dc_override, int * resid)
 	}
 }
 
-} // namespace wivrn::h264::xform
+} // namespace wivrn::avc::xform

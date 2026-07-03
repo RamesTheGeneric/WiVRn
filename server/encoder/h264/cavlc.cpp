@@ -20,7 +20,7 @@
 
 #include <cstdlib>
 
-namespace wivrn::h264
+namespace wivrn::avc
 {
 
 const int zigzag4x4[16] = {0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15};
@@ -298,4 +298,4 @@ int residual_block(bitwriter & w, const int * levels, int count, int nC, bool ch
 	return total_coeff;
 }
 
-} // namespace wivrn::h264
+} // namespace wivrn::avc

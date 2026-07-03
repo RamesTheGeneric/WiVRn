@@ -16,7 +16,7 @@
 #include <cstring>
 #include <vector>
 
-using namespace wivrn::h264;
+using namespace wivrn::avc;
 using namespace wivrn::h267::gpu;
 
 struct PC
@@ -83,7 +83,7 @@ int main(int argc, char ** argv)
 
 		std::vector<vk_compute::buffer *> binds = {&bSY, &bSC, &bRY, &bRCb, &bRCr, &bLDC, &bLAC, &bCDC, &bCAC, &bNL, &bNC};
 		std::vector<vk_compute::step> steps;
-		const int qpc = wivrn::h264::xform::chroma_qp(t.qp);
+		const int qpc = wivrn::avc::xform::chroma_qp(t.qp);
 		for (int d = 0; d <= mbw + mbh - 2; ++d) {
 			int s = std::max(0, d - (mbh - 1)), e = std::min(d, mbw - 1);
 			PC pc{(uint32_t)mbw, (uint32_t)mbh, t.qp, qpc, (uint32_t)cw, (uint32_t)ch, (uint32_t)ew, (uint32_t)eh, (uint32_t)d, (uint32_t)s};

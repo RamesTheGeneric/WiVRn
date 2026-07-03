@@ -121,6 +121,9 @@ if (WIVRN_BUILD_SERVER)
 			encoder/hevc/cpu_encoder.cpp
 			encoder/hevc/cabac_pass.cpp
 			encoder/hevc/gpu/gpu_reconstruct.cpp
+			encoder/h264/param_sets264.cpp
+			encoder/h264/transform264.cpp
+			encoder/h264/gpu/encoder264.cpp
 
 			driver/app_pacer.cpp
 			driver/clock_offset.cpp
@@ -289,6 +292,10 @@ if (WIVRN_BUILD_SERVER)
 			"${CMAKE_CURRENT_SOURCE_DIR}/encoder/hevc/gpu/shaders/hevc_recon_dc_luma.comp"
 			"${CMAKE_CURRENT_SOURCE_DIR}/encoder/hevc/gpu/shaders/hevc_recon_dc_chroma.comp"
 			"${CMAKE_CURRENT_SOURCE_DIR}/encoder/hevc/gpu/shaders/hevc_cabac.comp"
+			"${CMAKE_CURRENT_SOURCE_DIR}/encoder/h264/gpu/shaders/h264_recon_dc.comp"
+			"${CMAKE_CURRENT_SOURCE_DIR}/encoder/h264/gpu/shaders/h264_cavlc_emit.comp"
+			"${CMAKE_CURRENT_SOURCE_DIR}/encoder/h264/gpu/shaders/h264_cavlc_prefix.comp"
+			"${CMAKE_CURRENT_SOURCE_DIR}/encoder/h264/gpu/shaders/h264_cavlc_stitch.comp"
 		)
 
 	target_compile_definitions(wivrn-server PRIVATE JSON_DIAGNOSTICS=1)

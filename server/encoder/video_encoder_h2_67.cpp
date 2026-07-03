@@ -77,31 +77,46 @@ video_encoder_h2_67::video_encoder_h2_67(
 {
 	if (settings.bit_depth != 8)
 		throw std::runtime_error("h2-67 encoder only supports 8-bit encoding");
-	if (settings.codec != h265)
-		U_LOG_W("requested h2-67 encoder with codec != h265");
+	use_h264 = (settings.codec == h264);
 
 	luma_stride = extent.width;
 	chroma_stride = extent.width;
 
-	cfg.width = extent.width;
-	cfg.height = extent.height;
-	cfg.bit_depth = 8;
-	cfg.qp = parse_qp(settings);
-	cfg.max_tb_log2_size = 3;
-	parameter_sets = h267::build_parameter_sets(cfg);
+	const auto vphys = static_cast<VkPhysicalDevice>(*vk.physical_device);
+	const auto vdev = static_cast<VkDevice>(*vk.device);
+	const auto vqueue = static_cast<VkQueue>(*vk.queue.queue);
 
-	// Reconstruction + CABAC run on WiVRn's shared device with the embedded shaders.
-	const auto & luma_spv = ::shaders.at("hevc_recon_dc_luma");
-	const auto & chroma_spv = ::shaders.at("hevc_recon_dc_chroma");
-	const auto & cabac_spv = ::shaders.at("hevc_cabac");
-	recon.init_adopt(
-	        static_cast<VkPhysicalDevice>(*vk.physical_device),
-	        static_cast<VkDevice>(*vk.device),
-	        static_cast<VkQueue>(*vk.queue.queue),
-	        vk.queue.family_index,
-	        luma_spv.data(), luma_spv.size(),
-	        chroma_spv.data(), chroma_spv.size());
-	recon.init_cabac_adopt(cabac_spv.data(), cabac_spv.size());
+	if (use_h264)
+	{
+		h264_cfg.width = extent.width;
+		h264_cfg.height = extent.height;
+		h264_cfg.bit_depth = 8;
+		h264_cfg.qp = parse_qp(settings);
+		const auto & r = ::shaders.at("h264_recon_dc");
+		const auto & e = ::shaders.at("h264_cavlc_emit");
+		const auto & p = ::shaders.at("h264_cavlc_prefix");
+		const auto & s = ::shaders.at("h264_cavlc_stitch");
+		h264_enc.init_adopt(vphys, vdev, vqueue, vk.queue.family_index,
+		                    r.data(), r.size(), e.data(), e.size(), p.data(), p.size(), s.data(), s.size());
+	}
+	else
+	{
+		cfg.width = extent.width;
+		cfg.height = extent.height;
+		cfg.bit_depth = 8;
+		cfg.qp = parse_qp(settings);
+		cfg.max_tb_log2_size = 3;
+		parameter_sets = h267::build_parameter_sets(cfg);
+
+		// Reconstruction + CABAC run on WiVRn's shared device with the embedded shaders.
+		const auto & luma_spv = ::shaders.at("hevc_recon_dc_luma");
+		const auto & chroma_spv = ::shaders.at("hevc_recon_dc_chroma");
+		const auto & cabac_spv = ::shaders.at("hevc_cabac");
+		recon.init_adopt(vphys, vdev, vqueue, vk.queue.family_index,
+		                 luma_spv.data(), luma_spv.size(),
+		                 chroma_spv.data(), chroma_spv.size());
+		recon.init_cabac_adopt(cabac_spv.data(), cabac_spv.size());
+	}
 
 	// CTB rows per independent slice: fewer = better compression, more = more GPU
 	// CABAC parallelism. 1 row/slice maximises parallelism (CABAC is serial within
@@ -203,6 +218,33 @@ std::optional<video_encoder::data> video_encoder_h2_67::encode(uint8_t slot, uin
 
 	const uint8_t * luma = reinterpret_cast<const uint8_t *>(in[slot].luma.map());
 	const uint8_t * chroma = reinterpret_cast<const uint8_t *>(in[slot].chroma.map());
+
+	if (use_h264)
+	{
+		std::shared_ptr<std::vector<uint8_t>> frame;
+		{
+			std::unique_lock lock(vk.queue.mutex);
+			frame = std::make_shared<std::vector<uint8_t>>(
+			        h264_enc.encode_frame(h264_cfg, extent.width, extent.height, luma, chroma));
+		}
+		const auto & rt = h264_enc.last_timings;
+		prof.recon += rt.recon_us;
+		prof.cabac += rt.cavlc_us;
+		prof.build += rt.assemble_us;
+		prof.up += rt.upload;
+		prof.bytes += (double)frame->size();
+		static const bool profile_enabled = std::getenv("WIVRN_H267_PROFILE") != nullptr;
+		if (profile_enabled && ++prof.n >= prof_window)
+		{
+			const double n = prof.n;
+			U_LOG_W("h2-67/h264[%u] %.0fx%u avg/frame: up=%.0fus recon=%.0fus cavlc(gpu)=%.0fus asm=%.0fus | total=%.2fms frame=%.0fKB",
+			        stream_idx, (double)extent.width, extent.height, prof.up / n, prof.recon / n, prof.cabac / n, prof.build / n,
+			        (prof.up + prof.recon + prof.cabac + prof.build) / n / 1000.0, prof.bytes / n / 1024.0);
+			prof = {};
+		}
+		(void)frame_index;
+		return data{.encoder = this, .span = std::span<uint8_t>(*frame), .mem = frame, .prefer_control = true};
+	}
 
 	// Full GPU path: reconstruction + CABAC entirely on the GPU (the level buffers
 	// never leave the device); only the compressed per-slice payloads come back.

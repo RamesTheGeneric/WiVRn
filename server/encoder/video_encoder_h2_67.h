@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "h264/gpu/encoder264.h"
 #include "hevc/bitwriter.h"
 #include "hevc/cabac_pass.h"
 #include "hevc/gpu/gpu_reconstruct.h"
@@ -63,6 +64,11 @@ class video_encoder_h2_67 : public video_encoder
 	int slice_ctb_rows = 2; // CTB rows per independent slice (GPU CABAC parallelism)
 	// Reused per-slice CABAC payloads across frames (recon + entropy run on GPU).
 	std::vector<std::vector<uint8_t>> slice_payloads;
+
+	// H.264 path (codec == h264): fully-GPU reconstruction + parallel CAVLC.
+	bool use_h264 = false;
+	avc::h264_config h264_cfg;
+	avc::gpu::encoder h264_enc;
 
 	// Rolling per-stage profile, averaged and logged every prof_window frames.
 	struct profile

@@ -18,7 +18,7 @@
 
 #include "param_sets264.h"
 
-namespace wivrn::h264
+namespace wivrn::avc
 {
 
 void emit_nal(std::vector<uint8_t> & out, int nal_ref_idc, int nal_unit_type,
@@ -132,4 +132,4 @@ void write_slice_header(bitwriter & w, const h264_config & cfg, uint32_t first_m
 	// CAVLC: slice_data() follows immediately, no byte alignment.
 }
 
-} // namespace wivrn::h264
+} // namespace wivrn::avc

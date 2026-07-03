@@ -21,7 +21,7 @@
 #include <string>
 #include <vector>
 
-using namespace wivrn::h264;
+using namespace wivrn::avc;
 using namespace wivrn::h267::gpu;
 using bw = wivrn::h267::bitwriter;
 
@@ -83,7 +83,7 @@ int main(int argc, char ** argv)
 			c[((size_t)y * cw2 + x) * 2 + 1] = img.Cr[(size_t)y * cw2 + x]; } }
 
 		// recon
-		const int qpc = wivrn::h264::xform::chroma_qp(t.qp);
+		const int qpc = wivrn::avc::xform::chroma_qp(t.qp);
 		std::vector<vk_compute::buffer *> rbind = {&bSY, &bSC, &bRY, &bRCb, &bRCr, &bLDC, &bLAC, &bCDC, &bCAC, &bNL, &bNC};
 		std::vector<vk_compute::step> rsteps;
 		for (int d = 0; d <= mbw + mbh - 2; ++d) {
