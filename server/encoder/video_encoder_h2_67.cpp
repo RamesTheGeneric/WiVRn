@@ -162,6 +162,33 @@ video_encoder_h2_67::video_encoder_h2_67(
 
 void video_encoder_h2_67::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t slot, uint64_t)
 {
+	if (use_h264)
+	{
+		// Direct sampling: no copy. The compositor cycles a fixed pool of images, so
+		// cache the per-eye R8 / R8G8 plane views PER image (never destroy a view an
+		// in-flight encode may still be reading), record this frame's views + the
+		// compositor's ready-semaphore for encode() to wait on and sample directly.
+		VkImage vkimg = static_cast<VkImage>(y_cbcr);
+		auto it = h264_views.find(vkimg);
+		if (it == h264_views.end())
+		{
+			vk::ImageViewUsageCreateInfo usage{.usage = vk::ImageUsageFlagBits::eStorage};
+			auto mkview = [&](vk::Format fmt, vk::ImageAspectFlagBits aspect) {
+				return vk::raii::ImageView(vk.device, vk::ImageViewCreateInfo{
+				        .pNext = &usage, .image = y_cbcr, .viewType = vk::ImageViewType::e2D, .format = fmt,
+				        .subresourceRange = {.aspectMask = aspect, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = stream_idx, .layerCount = 1}});
+			};
+			it = h264_views.emplace(vkimg, std::pair{mkview(vk::Format::eR8Unorm, vk::ImageAspectFlagBits::ePlane0),
+			                                         mkview(vk::Format::eR8G8Unorm, vk::ImageAspectFlagBits::ePlane1)})
+			             .first;
+		}
+		in[slot].view_y = *it->second.first;
+		in[slot].view_c = *it->second.second;
+		in[slot].sem = static_cast<VkSemaphore>(compositor_sem.semaphore);
+		in[slot].sem_val = compositor_sem.value;
+		return;
+	}
+
 	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
 	{
 		U_LOG_E("Timeout on stream %d", stream_idx);
@@ -214,22 +241,17 @@ void video_encoder_h2_67::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInf
 
 std::optional<video_encoder::data> video_encoder_h2_67::encode(uint8_t slot, uint64_t frame_index)
 {
-	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
-	{
-		U_LOG_E("Timeout on stream %d", stream_idx);
-		return {};
-	}
-
-	const uint8_t * luma = reinterpret_cast<const uint8_t *>(in[slot].luma.map());
-	const uint8_t * chroma = reinterpret_cast<const uint8_t *>(in[slot].chroma.map());
-
 	if (use_h264)
 	{
+		// Direct sampling: the recon compute reads the compositor image's plane views
+		// directly (no copy), gated on its ready-semaphore, and blocks until done —
+		// so the compositor may reuse the image once encode() returns.
 		std::shared_ptr<std::vector<uint8_t>> frame;
 		{
 			std::unique_lock lock(*enc_queue_mutex);
 			frame = std::make_shared<std::vector<uint8_t>>(
-			        h264_enc.encode_frame(h264_cfg, extent.width, extent.height, luma, chroma));
+			        h264_enc.encode_frame_image(h264_cfg, extent.width, extent.height,
+			                                    in[slot].view_y, in[slot].view_c, in[slot].sem, in[slot].sem_val));
 		}
 		const auto & rt = h264_enc.last_timings;
 		prof.recon += rt.recon_us;
@@ -249,6 +271,15 @@ std::optional<video_encoder::data> video_encoder_h2_67::encode(uint8_t slot, uin
 		(void)frame_index;
 		return data{.encoder = this, .span = std::span<uint8_t>(*frame), .mem = frame, .prefer_control = true};
 	}
+
+	// HEVC path: wait the copy fence, then reconstruct from the mapped host planes.
+	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
+	{
+		U_LOG_E("Timeout on stream %d", stream_idx);
+		return {};
+	}
+	const uint8_t * luma = reinterpret_cast<const uint8_t *>(in[slot].luma.map());
+	const uint8_t * chroma = reinterpret_cast<const uint8_t *>(in[slot].chroma.map());
 
 	// Full GPU path: reconstruction + CABAC entirely on the GPU (the level buffers
 	// never leave the device); only the compressed per-slice payloads come back.

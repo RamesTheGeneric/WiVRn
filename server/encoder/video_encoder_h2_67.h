@@ -28,6 +28,8 @@
 
 #include <array>
 #include <cstdint>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 #include <vulkan/vulkan_raii.hpp>
 
@@ -53,10 +55,21 @@ class video_encoder_h2_67 : public video_encoder
 	{
 		vk::raii::Fence fence = nullptr;
 		vk::raii::CommandBuffer cmd = nullptr;
-		buffer_allocation luma;   // copied Y plane (8-bit, extent-sized)
-		buffer_allocation chroma; // copied CbCr plane (interleaved, half res)
+		buffer_allocation luma;   // copied Y plane (8-bit, extent-sized) — HEVC path only
+		buffer_allocation chroma; // copied CbCr plane (interleaved, half res) — HEVC path only
+		// H.264 direct-sampling path: this frame's source plane views + the
+		// compositor's ready-semaphore for this slot.
+		VkImageView view_y = VK_NULL_HANDLE;
+		VkImageView view_c = VK_NULL_HANDLE;
+		VkSemaphore sem = VK_NULL_HANDLE;
+		uint64_t sem_val = 0;
 	};
 	std::array<in_t, num_slots> in;
+
+	// H.264 direct sampling: per-eye R8 / R8G8 plane views, cached PER compositor
+	// pool image (the compositor cycles a fixed set). Views live for the encoder's
+	// lifetime so an in-flight encode's view is never destroyed under it.
+	std::unordered_map<VkImage, std::pair<vk::raii::ImageView, vk::raii::ImageView>> h264_views;
 
 	uint32_t luma_stride;
 	uint32_t chroma_stride;
