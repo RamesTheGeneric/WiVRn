@@ -25,7 +25,7 @@ using namespace wivrn::avc;
 using namespace wivrn::h267::gpu;
 using bw = wivrn::h267::bitwriter;
 
-struct RPC { uint32_t mbw, mbh; int32_t qp, qpc; uint32_t cw, ch, ew, eh, nmb; };
+struct RPC { uint32_t mbw, mbh; int32_t qp, qpc; uint32_t cw, ch, ew, eh, nmb, full_recon; };
 struct EPC { uint32_t mbw, mbh, stride_words, lgw, cgw, cgh; };
 
 struct PPC { uint32_t nmb, base_bits; };
@@ -96,7 +96,7 @@ int main(int argc, char ** argv)
 		}
 		auto bHalo = vk.make_buffer((size_t)nmb * 16 * 4, true);
 		std::vector<vk_compute::buffer *> rbind = {&bSY, &bSC, &bRY, &bRCb, &bRCr, &bLDC, &bLAC, &bCDC, &bCAC, &bNL, &bNC, &bOrd, &bClaim, &bDone, &bHalo};
-		RPC rpc{(uint32_t)mbw, (uint32_t)mbh, t.qp, qpc, (uint32_t)cw, (uint32_t)ch, (uint32_t)ew, (uint32_t)eh, (uint32_t)nmb};
+		RPC rpc{(uint32_t)mbw, (uint32_t)mbh, t.qp, qpc, (uint32_t)cw, (uint32_t)ch, (uint32_t)ew, (uint32_t)eh, (uint32_t)nmb, 1u};
 		vk.run(rpipe, rbind, std::min(nmb, 64), 1, 1, &rpc, sizeof(rpc));
 
 		// emit

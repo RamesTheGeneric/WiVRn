@@ -23,7 +23,7 @@ struct PC
 {
 	uint32_t mbw, mbh;
 	int32_t qp, qpc;
-	uint32_t cw, ch, ew, eh, nmb;
+	uint32_t cw, ch, ew, eh, nmb, full_recon;
 };
 
 int main(int argc, char ** argv)
@@ -97,7 +97,7 @@ int main(int argc, char ** argv)
 		auto bHalo = vk.make_buffer((size_t)nmb * 16 * 4, true);
 		std::vector<vk_compute::buffer *> binds = {&bSY, &bSC, &bRY, &bRCb, &bRCr, &bLDC, &bLAC, &bCDC, &bCAC, &bNL, &bNC, &bOrd, &bClaim, &bDone, &bHalo};
 		const int qpc = wivrn::avc::xform::chroma_qp(t.qp);
-		PC pc{(uint32_t)mbw, (uint32_t)mbh, t.qp, qpc, (uint32_t)cw, (uint32_t)ch, (uint32_t)ew, (uint32_t)eh, (uint32_t)nmb};
+		PC pc{(uint32_t)mbw, (uint32_t)mbh, t.qp, qpc, (uint32_t)cw, (uint32_t)ch, (uint32_t)ew, (uint32_t)eh, (uint32_t)nmb, 1u};
 		vk.run(pipe, binds, std::min(nmb, 64), 1, 1, &pc, sizeof(pc));
 
 		int mism = 0;

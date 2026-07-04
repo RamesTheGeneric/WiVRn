@@ -51,6 +51,9 @@ layout(push_constant) uniform PC {
 	uint cw, ch;   // coded luma dims
 	uint ew, eh;   // extent (source) luma dims
 	uint nmb;
+	uint full_recon; // 1 = write the full recon planes (tests); 0 = live: only the
+	                 // boundary blocks that feed the halo are reconstructed, the
+	                 // unused interior recon is skipped. Bitstream is identical.
 } pc;
 
 const int MF[6][3] = int[6][3](int[3](13107, 5243, 8066), int[3](11916, 4660, 7490), int[3](10082, 4194, 6554),
@@ -306,37 +309,48 @@ void main()
 	}
 	barrier();
 
-	// ---- reconstruction (AC levels from carry_lv). Writes the packed-u8 recon
-	// plane (4 px/word) and, on boundary blocks, this MB's coherent halo. ----
+	// ---- reconstruction (AC levels from carry_lv). Writes this MB's coherent halo
+	// on boundary blocks; the packed-u8 recon plane only when full_recon (tests).
+	// Live path: interior blocks (never read via halo) are skipped entirely. ----
+	bool full = pc.full_recon != 0u;
 	uint cwW = uint(cw) >> 2u; // luma words per row
 	if (t < 16u) {
 		int bx = int(t & 3u), by = int(t >> 2);
-		int res[16];
-		idct4(carry_lv, pc.qp, dcYL[by*4+bx], res);
-		int rc[16];
-		for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) rc[r*4+c] = clippix(predY + res[r*4+c]);
-		for (int r = 0; r < 4; ++r)
-			recY.v[uint(py + by*4 + r) * cwW + (uint(px + bx*4) >> 2u)] = pack4(rc[r*4+0], rc[r*4+1], rc[r*4+2], rc[r*4+3]);
-		if (by == 3) halo.v[nmb_idx * 16u + uint(bx)] = pack4(rc[12], rc[13], rc[14], rc[15]);        // bottom row
-		if (bx == 3) halo.v[nmb_idx * 16u + 4u + uint(by)] = pack4(rc[3], rc[7], rc[11], rc[15]);     // right col
+		bool bnd = (bx == 3) || (by == 3);
+		if (full || bnd) {
+			int res[16];
+			idct4(carry_lv, pc.qp, dcYL[by*4+bx], res);
+			int rc[16];
+			for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) rc[r*4+c] = clippix(predY + res[r*4+c]);
+			if (full)
+				for (int r = 0; r < 4; ++r)
+					recY.v[uint(py + by*4 + r) * cwW + (uint(px + bx*4) >> 2u)] = pack4(rc[r*4+0], rc[r*4+1], rc[r*4+2], rc[r*4+3]);
+			if (by == 3) halo.v[nmb_idx * 16u + uint(bx)] = pack4(rc[12], rc[13], rc[14], rc[15]);        // bottom row
+			if (bx == 3) halo.v[nmb_idx * 16u + 4u + uint(by)] = pack4(rc[3], rc[7], rc[11], rc[15]);     // right col
+		}
 	} else if (t < 24u) {
 		int comp = (t < 20u) ? 0 : 1;
 		int sb = int(t) - (comp == 0 ? 16 : 20);
 		int sbx = (sb & 1) * 4, sby = (sb >> 1) * 4;
-		int pcv = comp == 0 ? predCb[sb] : predCr[sb];
-		int dcov = comp == 0 ? dcYCb[(sby/4)*2+(sbx/4)] : dcYCr[(sby/4)*2+(sbx/4)];
-		int res[16];
-		idct4(carry_lv, pc.qpc, dcov, res);
-		int rc[16];
-		for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) rc[r*4+c] = clippix(pcv + res[r*4+c]);
-		uint cw2W = uint(cw) >> 3u; // chroma words per row = (cw/2)/4
-		for (int r = 0; r < 4; ++r) {
-			uint word = uint(cpy + sby + r) * cw2W + (uint(cpx + sbx) >> 2u);
-			uint packed = pack4(rc[r*4+0], rc[r*4+1], rc[r*4+2], rc[r*4+3]);
-			if (comp == 0) recCb.v[word] = packed; else recCr.v[word] = packed;
+		bool bnd = (sbx == 4) || (sby == 4);
+		if (full || bnd) {
+			int pcv = comp == 0 ? predCb[sb] : predCr[sb];
+			int dcov = comp == 0 ? dcYCb[(sby/4)*2+(sbx/4)] : dcYCr[(sby/4)*2+(sbx/4)];
+			int res[16];
+			idct4(carry_lv, pc.qpc, dcov, res);
+			int rc[16];
+			for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) rc[r*4+c] = clippix(pcv + res[r*4+c]);
+			if (full) {
+				uint cw2W = uint(cw) >> 3u; // chroma words per row = (cw/2)/4
+				for (int r = 0; r < 4; ++r) {
+					uint word = uint(cpy + sby + r) * cw2W + (uint(cpx + sbx) >> 2u);
+					uint packed = pack4(rc[r*4+0], rc[r*4+1], rc[r*4+2], rc[r*4+3]);
+					if (comp == 0) recCb.v[word] = packed; else recCr.v[word] = packed;
+				}
+			}
+			if (sby == 4) halo.v[nmb_idx * 16u + 8u + uint(comp) * 4u + uint(sbx >> 2)] = pack4(rc[12], rc[13], rc[14], rc[15]);
+			if (sbx == 4) halo.v[nmb_idx * 16u + 10u + uint(comp) * 4u + uint(sby >> 2)] = pack4(rc[3], rc[7], rc[11], rc[15]);
 		}
-		if (sby == 4) halo.v[nmb_idx * 16u + 8u + uint(comp) * 4u + uint(sbx >> 2)] = pack4(rc[12], rc[13], rc[14], rc[15]);
-		if (sbx == 4) halo.v[nmb_idx * 16u + 10u + uint(comp) * 4u + uint(sby >> 2)] = pack4(rc[3], rc[7], rc[11], rc[15]);
 	}
 
 	// All lanes have written this MB's reconstruction (coherent -> device

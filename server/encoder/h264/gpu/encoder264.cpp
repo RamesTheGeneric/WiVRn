@@ -30,7 +30,7 @@ namespace wivrn::avc::gpu
 namespace
 {
 #pragma pack(push, 1)
-struct RPC { uint32_t mbw, mbh; int32_t qp, qpc; uint32_t cw, ch, ew, eh, nmb; };
+struct RPC { uint32_t mbw, mbh; int32_t qp, qpc; uint32_t cw, ch, ew, eh, nmb, full_recon; };
 struct EPC { uint32_t mbw, mbh, stride_words, lgw, cgw, cgh; };
 struct PPC { uint32_t nmb, base_bits; };
 struct SPC { uint32_t nmb, stride_words; };
@@ -135,7 +135,10 @@ std::vector<uint8_t> encoder::encode_frame(const h264_config & cfg, int ew, int 
 	// workgroup count for forward progress; 64 is trivially resident on the
 	// 16-CU APU and exceeds the max anti-diagonal width (no lost parallelism).
 	std::vector<vk_compute::buffer *> rbind = {&sY, &sChroma, &rY, &rCb, &rCr, &lDC, &lAC, &cDC, &cAC, &nnzL, &nnzC, &mbOrder, &claim, &doneBuf, &haloBuf};
-	const RPC rpc{(uint32_t)mbw, (uint32_t)mbh, cfg.qp, qpc, (uint32_t)cw, (uint32_t)ch, (uint32_t)ew, (uint32_t)eh, (uint32_t)nmb};
+	// Only reconstruct the full planes when the caller wants them (tests); the live
+	// path (nullptr recon) skips the unused interior-block reconstruction.
+	const uint32_t full_recon = (recY || recCb || recCr) ? 1u : 0u;
+	const RPC rpc{(uint32_t)mbw, (uint32_t)mbh, cfg.qp, qpc, (uint32_t)cw, (uint32_t)ch, (uint32_t)ew, (uint32_t)eh, (uint32_t)nmb, full_recon};
 	uint32_t recon_wg_cap = 64u;
 	if (const char * e = std::getenv("WIVRN_H264_RECON_WG")) { int w = std::atoi(e); if (w > 0) recon_wg_cap = (uint32_t)w; }
 	const uint32_t recon_wg = std::min<uint32_t>((uint32_t)nmb, recon_wg_cap);
