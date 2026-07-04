@@ -37,7 +37,7 @@ int main(int argc, char ** argv)
 	const char * pspv = argc > 3 ? argv[3] : nullptr, *sspv = argc > 4 ? argv[4] : nullptr;
 	vk_compute vk;
 	vk.init();
-	auto rpipe = vk.make_pipeline(rspv, 15, sizeof(RPC));
+	auto rpipe = vk.make_pipeline(rspv, 15, sizeof(RPC), 2);
 	auto epipe = vk.make_pipeline(espv, 8, sizeof(EPC));
 	bool haveStitch = pspv && sspv;
 	vk_compute::pipeline ppipe{}, spipe{};
@@ -63,8 +63,6 @@ int main(int argc, char ** argv)
 		auto frameCPU = encode_idr_frame(cfg, img);
 
 		auto round4 = [](size_t n) { return (n + 3) & ~size_t(3); };
-		auto bSY = vk.make_buffer(round4((size_t)ew * eh));
-		auto bSC = vk.make_buffer(round4((size_t)ew * eh / 2));
 		auto bRY = vk.make_buffer(round4((size_t)cw * ch), true);      // packed u8
 		auto bRCb = vk.make_buffer(round4((size_t)cw2 * ch2), true);   // packed u8
 		auto bRCr = vk.make_buffer(round4((size_t)cw2 * ch2), true);   // packed u8
@@ -77,10 +75,13 @@ int main(int argc, char ** argv)
 		auto bScratch = vk.make_buffer((size_t)nmb * STRIDE * 4, true);
 		auto bBitLen = vk.make_buffer((size_t)nmb * 4, true);
 
-		memcpy(bSY.ptr, img.Y.data(), (size_t)ew * eh);
-		{ uint8_t * c = (uint8_t *)bSC.ptr; for (int y = 0; y < ch2; ++y) for (int x = 0; x < cw2; ++x) {
-			c[((size_t)y * cw2 + x) * 2 + 0] = img.Cb[(size_t)y * cw2 + x];
-			c[((size_t)y * cw2 + x) * 2 + 1] = img.Cr[(size_t)y * cw2 + x]; } }
+		std::vector<uint8_t> chroma((size_t)cw2 * ch2 * 2);
+		for (int y = 0; y < ch2; ++y) for (int x = 0; x < cw2; ++x) {
+			chroma[((size_t)y * cw2 + x) * 2 + 0] = img.Cb[(size_t)y * cw2 + x];
+			chroma[((size_t)y * cw2 + x) * 2 + 1] = img.Cr[(size_t)y * cw2 + x];
+		}
+		auto yimg = vk.make_yuv_image(ew, eh);
+		vk.upload_yuv(yimg, img.Y.data(), chroma.data());
 
 		// recon (scoreboard: single dispatch of persistent workgroups)
 		const int qpc = wivrn::avc::xform::chroma_qp(t.qp);
@@ -95,9 +96,9 @@ int main(int argc, char ** argv)
 			memset(bClaim.ptr, 0, 4); memset(bDone.ptr, 0, (size_t)nmb * 4);
 		}
 		auto bHalo = vk.make_buffer((size_t)nmb * 16 * 4, true);
-		std::vector<vk_compute::buffer *> rbind = {&bSY, &bSC, &bRY, &bRCb, &bRCr, &bLDC, &bLAC, &bCDC, &bCAC, &bNL, &bNC, &bOrd, &bClaim, &bDone, &bHalo};
+		std::vector<vk_compute::buffer *> rbind = {&bRY, &bRCb, &bRCr, &bLDC, &bLAC, &bCDC, &bCAC, &bNL, &bNC, &bOrd, &bClaim, &bDone, &bHalo};
 		RPC rpc{(uint32_t)mbw, (uint32_t)mbh, t.qp, qpc, (uint32_t)cw, (uint32_t)ch, (uint32_t)ew, (uint32_t)eh, (uint32_t)nmb, 1u};
-		vk.run(rpipe, rbind, std::min(nmb, 64), 1, 1, &rpc, sizeof(rpc));
+		vk.run_img(rpipe, {yimg.view_y, yimg.view_c}, rbind, std::min(nmb, 64), 1, 1, &rpc, sizeof(rpc));
 
 		// emit
 		EPC epc{(uint32_t)mbw, (uint32_t)mbh, STRIDE, (uint32_t)(cw / 4), (uint32_t)(cw / 8), (uint32_t)(ch / 8)};
@@ -173,7 +174,8 @@ int main(int argc, char ** argv)
 		printf("%dx%d qp%d: gpu=%zu cpu=%zu byteExact=%d gpuStitch=%d decode=%s mism=%d  %s\n",
 		       t.w, t.h, t.qp, frameGPU.size(), frameCPU.size(), byteExact ? 1 : 0, stitchOK ? 1 : 0, dec ? "ok" : "FAIL", mism, pass ? "PASS" : "FAIL");
 
-		for (auto * bb : {&bSY, &bSC, &bRY, &bRCb, &bRCr, &bLDC, &bLAC, &bCDC, &bCAC, &bNL, &bNC, &bScratch, &bBitLen, &bOrd, &bClaim, &bDone, &bHalo}) vk.destroy_buffer(*bb);
+		for (auto * bb : {&bRY, &bRCb, &bRCr, &bLDC, &bLAC, &bCDC, &bCAC, &bNL, &bNC, &bScratch, &bBitLen, &bOrd, &bClaim, &bDone, &bHalo}) vk.destroy_buffer(*bb);
+		vk.destroy_yuv_image(yimg);
 	}
 	printf("\n%s (%d failures)\n", fails == 0 ? "GPU CAVLC BYTE-EXACT + DECODE PIXEL-EXACT" : "FAILURES", fails);
 	return fails ? 1 : 0;

@@ -21,8 +21,11 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 layout(local_size_x = 32) in;
 
-layout(set = 0, binding = 0, std430) readonly buffer SrcY { uint v[]; } srcY;   // packed u8 luma (ew*eh)
-layout(set = 0, binding = 1, std430) readonly buffer SrcC { uint v[]; } srcC;   // packed u8 interleaved CbCr
+// Source planes sampled DIRECTLY from the compositor's multi-planar image (no
+// copy): srcY = R8 view of plane 0 (luma, extent res), srcC = R8G8 view of
+// plane 1 (interleaved CbCr, half res). round(unorm*255) recovers the exact byte.
+layout(set = 0, binding = 0, r8) uniform readonly image2D srcY;
+layout(set = 0, binding = 1, rg8) uniform readonly image2D srcC;
 // recon planes: NON-coherent, packed u8 (4 px/word), write-only. Neighbours no
 // longer read these (they read the coherent `halo` buffer instead), so the bulk
 // reconstruction never touches coherent/L2-synced memory.
@@ -70,16 +73,15 @@ int u8Y(int x, int y)
 {
 	x = min(x, int(pc.ew) - 1);
 	y = min(y, int(pc.eh) - 1);
-	uint bi = uint(y) * pc.ew + uint(x);
-	return int((srcY.v[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xffu);
+	return int(round(imageLoad(srcY, ivec2(x, y)).r * 255.0));
 }
 int u8C(int x, int y, uint comp)
 {
 	int ewc = int(pc.ew) / 2, ehc = int(pc.eh) / 2;
 	x = min(x, ewc - 1);
 	y = min(y, ehc - 1);
-	uint bi = (uint(y) * uint(ewc) + uint(x)) * 2u + comp;
-	return int((srcC.v[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xffu);
+	vec2 cc = imageLoad(srcC, ivec2(x, y)).rg;
+	return int(round((comp == 0u ? cc.r : cc.g) * 255.0));
 }
 
 // 4x4 forward core transform (raster in/out).

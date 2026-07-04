@@ -78,6 +78,7 @@ public:
 		VkDescriptorPool dpool = VK_NULL_HANDLE;
 		VkDescriptorSet dset = VK_NULL_HANDLE;
 		int nbindings = 0;
+		int n_img = 0; // first n_img bindings are STORAGE_IMAGE, the rest STORAGE_BUFFER
 		int push_bytes = 0;
 	};
 
@@ -249,6 +250,96 @@ public:
 		b = {};
 	}
 
+	// --- Multi-planar YUV 4:2:0 image (G8_B8R8_2PLANE_420) for direct sampling.
+	// view_y is an R8 view of plane 0 (luma), view_c an R8G8 view of plane 1
+	// (interleaved CbCr, half res). Matches the WiVRn compositor's encoder image,
+	// so the recon shader's imageLoad path is exercised by offline tests too. ---
+	struct yuv_image
+	{
+		VkImage img = VK_NULL_HANDLE;
+		VkDeviceMemory mem = VK_NULL_HANDLE;
+		VkImageView view_y = VK_NULL_HANDLE; // R8, plane 0
+		VkImageView view_c = VK_NULL_HANDLE; // R8G8, plane 1
+		buffer staging{};                    // host, for CPU uploads (offline)
+		int w = 0, h = 0;
+	};
+
+	yuv_image make_yuv_image(int w, int h)
+	{
+		yuv_image y; y.w = w; y.h = h;
+		VkFormat plane_fmts[3] = {VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM};
+		VkImageFormatListCreateInfo fl{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+		fl.viewFormatCount = 3; fl.pViewFormats = plane_fmts;
+		VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO}; ici.pNext = &fl;
+		ici.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+		ici.imageType = VK_IMAGE_TYPE_2D; ici.format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+		ici.extent = {(uint32_t)w, (uint32_t)h, 1}; ici.mipLevels = 1; ici.arrayLayers = 1;
+		ici.samples = VK_SAMPLE_COUNT_1_BIT; ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+		ici.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		vkcheck(vkCreateImage(dev, &ici, nullptr, &y.img), "createYuvImage");
+		VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, y.img, &mr);
+		VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+		uint32_t mt = ~0u;
+		for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+			if ((mr.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { mt = i; break; }
+		VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; mai.allocationSize = mr.size; mai.memoryTypeIndex = mt;
+		vkcheck(vkAllocateMemory(dev, &mai, nullptr, &y.mem), "allocYuvMem");
+		vkcheck(vkBindImageMemory(dev, y.img, y.mem, 0), "bindYuvMem");
+		auto mkview = [&](VkImageView & v, VkFormat f, VkImageAspectFlags a) {
+			VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+			vci.image = y.img; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = f;
+			vci.subresourceRange = {a, 0, 1, 0, 1};
+			vkcheck(vkCreateImageView(dev, &vci, nullptr, &v), "yuvView");
+		};
+		mkview(y.view_y, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_PLANE_0_BIT);
+		mkview(y.view_c, VK_FORMAT_R8G8_UNORM, VK_IMAGE_ASPECT_PLANE_1_BIT);
+		y.staging = make_buffer((size_t)w * h + (size_t)(w / 2) * (h / 2) * 2);
+		return y;
+	}
+
+	// Upload extent-sized luma + interleaved CbCr into the image and leave it in
+	// GENERAL layout (synchronous; offline path only). Live path samples the
+	// compositor image directly and never calls this.
+	void upload_yuv(yuv_image & y, const uint8_t * luma, const uint8_t * chroma)
+	{
+		size_t yb = (size_t)y.w * y.h, cb = (size_t)(y.w / 2) * (y.h / 2) * 2;
+		std::memcpy(y.staging.ptr, luma, yb);
+		std::memcpy((uint8_t *)y.staging.ptr + yb, chroma, cb);
+		VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+		cbai.commandPool = pool; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbai.commandBufferCount = 1;
+		VkCommandBuffer cmd; vkAllocateCommandBuffers(dev, &cbai, &cmd);
+		VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		vkBeginCommandBuffer(cmd, &bi);
+		auto barrier = [&](VkImageLayout o, VkImageLayout n, VkAccessFlags sa, VkAccessFlags da, VkPipelineStageFlags ss, VkPipelineStageFlags ds) {
+			VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}; b.oldLayout = o; b.newLayout = n; b.image = y.img;
+			b.srcAccessMask = sa; b.dstAccessMask = da; b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+			vkCmdPipelineBarrier(cmd, ss, ds, 0, 0, nullptr, 0, nullptr, 1, &b);
+		};
+		barrier(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+		VkBufferImageCopy c0{}; c0.bufferOffset = 0; c0.imageSubresource = {VK_IMAGE_ASPECT_PLANE_0_BIT, 0, 0, 1}; c0.imageExtent = {(uint32_t)y.w, (uint32_t)y.h, 1};
+		vkCmdCopyBufferToImage(cmd, y.staging.buf, y.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c0);
+		VkBufferImageCopy c1{}; c1.bufferOffset = yb; c1.imageSubresource = {VK_IMAGE_ASPECT_PLANE_1_BIT, 0, 0, 1}; c1.imageExtent = {(uint32_t)(y.w / 2), (uint32_t)(y.h / 2), 1};
+		vkCmdCopyBufferToImage(cmd, y.staging.buf, y.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c1);
+		barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+		vkEndCommandBuffer(cmd);
+		VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence fence; vkCreateFence(dev, &fci, nullptr, &fence);
+		VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+		vkQueueSubmit(queue, 1, &si, fence); vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX);
+		vkDestroyFence(dev, fence, nullptr); vkFreeCommandBuffers(dev, pool, 1, &cmd);
+	}
+
+	void destroy_yuv_image(yuv_image & y)
+	{
+		if (y.view_y) vkDestroyImageView(dev, y.view_y, nullptr);
+		if (y.view_c) vkDestroyImageView(dev, y.view_c, nullptr);
+		if (y.img) vkDestroyImage(dev, y.img, nullptr);
+		if (y.mem) vkFreeMemory(dev, y.mem, nullptr);
+		destroy_buffer(y.staging);
+		y = {};
+	}
+
 	void destroy_pipeline(pipeline & p)
 	{
 		if (p.dpool)
@@ -279,18 +370,20 @@ public:
 		return code;
 	}
 
-	pipeline make_pipeline(const char * spv_path, int nbindings, int push_bytes = 0)
+	pipeline make_pipeline(const char * spv_path, int nbindings, int push_bytes = 0, int n_image_bindings = 0)
 	{
 		auto code = read_spv(spv_path);
-		return make_pipeline_from_code(code.data(), code.size(), nbindings, push_bytes);
+		return make_pipeline_from_code(code.data(), code.size(), nbindings, push_bytes, n_image_bindings);
 	}
 
 	// Build a compute pipeline from SPIR-V words already in memory (the shape used
 	// inside WiVRn, where shaders are embedded as a std::map<string,vector<u32>>).
-	pipeline make_pipeline_from_code(const uint32_t * code, size_t words, int nbindings, int push_bytes = 0)
+	// The first n_image_bindings descriptors are STORAGE_IMAGE, the rest STORAGE_BUFFER.
+	pipeline make_pipeline_from_code(const uint32_t * code, size_t words, int nbindings, int push_bytes = 0, int n_image_bindings = 0)
 	{
 		pipeline p;
 		p.nbindings = nbindings;
+		p.n_img = n_image_bindings;
 		p.push_bytes = push_bytes;
 		VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
 		smci.codeSize = words * 4;
@@ -299,7 +392,7 @@ public:
 
 		std::vector<VkDescriptorSetLayoutBinding> binds(nbindings);
 		for (int i = 0; i < nbindings; ++i)
-			binds[i] = {(uint32_t)i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+			binds[i] = {(uint32_t)i, i < n_image_bindings ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 		VkDescriptorSetLayoutCreateInfo dlci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
 		dlci.bindingCount = nbindings;
 		dlci.pBindings = binds.data();
@@ -324,11 +417,16 @@ public:
 		cpci.layout = p.layout;
 		vkcheck(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpci, nullptr, &p.pipe), "computePipeline");
 
-		VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (uint32_t)nbindings};
+		VkDescriptorPoolSize ps[2];
+		uint32_t nps = 0;
+		if (nbindings - n_image_bindings > 0)
+			ps[nps++] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (uint32_t)(nbindings - n_image_bindings)};
+		if (n_image_bindings > 0)
+			ps[nps++] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, (uint32_t)n_image_bindings};
 		VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
 		dpci.maxSets = 1;
-		dpci.poolSizeCount = 1;
-		dpci.pPoolSizes = &ps;
+		dpci.poolSizeCount = nps;
+		dpci.pPoolSizes = ps;
 		vkcheck(vkCreateDescriptorPool(dev, &dpci, nullptr, &p.dpool), "descPool");
 		VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
 		dsai.descriptorPool = p.dpool;
@@ -399,6 +497,29 @@ public:
 		vkcheck(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX), "waitFence");
 		vkDestroyFence(dev, fence, nullptr);
 		vkFreeCommandBuffers(dev, pool, 1, &cmd);
+	}
+
+	// Bind image views (first bindings) + buffers, dispatch, block. For tests that
+	// exercise the image-sampling recon path via a single dispatch.
+	void run_img(pipeline & p, const std::vector<VkImageView> & imgs, const std::vector<buffer *> & bufs,
+	             uint32_t gx, uint32_t gy, uint32_t gz, const void * push = nullptr, int push_bytes = 0)
+	{
+		bind_set_img(p, imgs, bufs);
+		VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+		cbai.commandPool = pool; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbai.commandBufferCount = 1;
+		VkCommandBuffer cmd; vkcheck(vkAllocateCommandBuffers(dev, &cbai, &cmd), "allocCmd");
+		VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		vkBeginCommandBuffer(cmd, &bi);
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &p.dset, 0, nullptr);
+		if (push && push_bytes > 0) vkCmdPushConstants(cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes, push);
+		vkCmdDispatch(cmd, gx, gy, gz);
+		vkEndCommandBuffer(cmd);
+		VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence fence; vkCreateFence(dev, &fci, nullptr, &fence);
+		VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+		vkcheck(vkQueueSubmit(queue, 1, &si, fence), "queueSubmit");
+		vkcheck(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX), "waitFence");
+		vkDestroyFence(dev, fence, nullptr); vkFreeCommandBuffers(dev, pool, 1, &cmd);
 	}
 
 	// Bind buffers and dispatch (gx,gy,gz workgroups). Blocks until complete.
@@ -478,6 +599,31 @@ private:
 		}
 		vkUpdateDescriptorSets(dev, (uint32_t)writes.size(), writes.data(), 0, nullptr);
 	}
+	// Bind image views to bindings [0, imgs.size()) as STORAGE_IMAGE (GENERAL
+	// layout) and buffers to the following bindings.
+	void bind_set_img(pipeline & p, const std::vector<VkImageView> & imgs, const std::vector<buffer *> & bufs)
+	{
+		size_t n = imgs.size() + bufs.size();
+		std::vector<VkDescriptorImageInfo> iinfos(imgs.size());
+		std::vector<VkDescriptorBufferInfo> binfos(bufs.size());
+		std::vector<VkWriteDescriptorSet> writes(n);
+		for (size_t i = 0; i < imgs.size(); ++i)
+		{
+			iinfos[i] = {VK_NULL_HANDLE, imgs[i], VK_IMAGE_LAYOUT_GENERAL};
+			writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+			writes[i].dstSet = p.dset; writes[i].dstBinding = (uint32_t)i; writes[i].descriptorCount = 1;
+			writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[i].pImageInfo = &iinfos[i];
+		}
+		for (size_t i = 0; i < bufs.size(); ++i)
+		{
+			binfos[i] = {bufs[i]->buf, 0, VK_WHOLE_SIZE};
+			size_t w = imgs.size() + i;
+			writes[w] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+			writes[w].dstSet = p.dset; writes[w].dstBinding = (uint32_t)w; writes[w].descriptorCount = 1;
+			writes[w].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[w].pBufferInfo = &binfos[i];
+		}
+		vkUpdateDescriptorSets(dev, (uint32_t)writes.size(), writes.data(), 0, nullptr);
+	}
 	void compute_barrier(VkCommandBuffer cmd)
 	{
 		VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -551,6 +697,21 @@ public:
 	                     uint32_t gx, uint32_t gy, uint32_t gz, const void * push, int push_bytes, bool leading_barrier)
 	{
 		bind_set(p, bindings);
+		if (leading_barrier)
+			compute_barrier(b.cmd);
+		vkCmdBindPipeline(b.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
+		vkCmdBindDescriptorSets(b.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &p.dset, 0, nullptr);
+		if (push && push_bytes > 0)
+			vkCmdPushConstants(b.cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes, push);
+		vkCmdDispatch(b.cmd, gx, gy, gz);
+	}
+
+	// Like record_dispatch, but the first bindings are STORAGE_IMAGE views (imgs)
+	// and the rest are buffers. Used by the recon stage sampling the source image.
+	void record_dispatch_img(batch & b, pipeline & p, const std::vector<VkImageView> & imgs, const std::vector<buffer *> & bufs,
+	                         uint32_t gx, uint32_t gy, uint32_t gz, const void * push, int push_bytes, bool leading_barrier)
+	{
+		bind_set_img(p, imgs, bufs);
 		if (leading_barrier)
 			compute_barrier(b.cmd);
 		vkCmdBindPipeline(b.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);

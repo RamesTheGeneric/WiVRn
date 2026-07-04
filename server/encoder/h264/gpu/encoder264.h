@@ -39,8 +39,9 @@ class encoder
 	bool ready = false;
 
 	int alloc_cw = 0, alloc_ch = 0, alloc_ew = 0;
-	// source (write-combined) + everything the CPU reads back (cached)
-	vk_compute::buffer sY{}, sChroma{};
+	// source YUV image (offline: CPU-uploaded; live: unused, we sample the
+	// compositor image directly) + everything the CPU reads back (cached)
+	vk_compute::yuv_image srcImg{};
 	vk_compute::buffer rY{}, rCb{}, rCr{};
 	vk_compute::buffer lDC{}, lAC{}, cDC{}, cAC{}, nnzL{}, nnzC{};
 	vk_compute::buffer scratch{}, bitLen{}, offset{}, total{}, outbits{};
@@ -50,6 +51,13 @@ class encoder
 	uint32_t stride_words = 256;
 
 	void ensure_buffers(const h264_config & cfg, int ew, int eh);
+	// Shared encode: recon (sampling the given source plane views) + CAVLC + CPU
+	// assembly. wait_sem/wait_val optionally gate the submit on the compositor's
+	// timeline semaphore (live direct-sampling path).
+	std::vector<uint8_t> encode_image(const h264_config & cfg, int ew, int eh,
+	                                  VkImageView srcY_view, VkImageView srcC_view,
+	                                  VkSemaphore wait_sem, uint64_t wait_val,
+	                                  uint8_t * recY, uint8_t * recCb, uint8_t * recCr, double upload_us);
 
 public:
 	// Adopt WiVRn's device + the four embedded shaders' SPIR-V.
@@ -68,6 +76,13 @@ public:
 	std::vector<uint8_t> encode_frame(const h264_config & cfg, int ew, int eh,
 	                                  const uint8_t * lumaU8, const uint8_t * chromaU8,
 	                                  uint8_t * recY = nullptr, uint8_t * recCb = nullptr, uint8_t * recCr = nullptr);
+
+	// Live path: sample the compositor's plane views directly (no copy). The
+	// submit waits on the compositor's timeline semaphore (wait_sem, wait_val).
+	std::vector<uint8_t> encode_frame_image(const h264_config & cfg, int ew, int eh,
+	                                        VkImageView srcY_view, VkImageView srcC_view,
+	                                        VkSemaphore wait_sem, uint64_t wait_val,
+	                                        uint8_t * recY = nullptr, uint8_t * recCb = nullptr, uint8_t * recCr = nullptr);
 
 	// Timing (microseconds) of the last encode_frame's stages.
 	struct timings { double upload = 0, recon_us = 0, cavlc_us = 0, assemble_us = 0;

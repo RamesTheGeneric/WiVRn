@@ -44,7 +44,7 @@ void encoder::init_adopt(VkPhysicalDevice phys, VkDevice dev, VkQueue queue, uin
                          const uint32_t * stitch_spv, size_t stitch_words)
 {
 	vkc.adopt(phys, dev, queue, qfam);
-	recon = vkc.make_pipeline_from_code(recon_spv, recon_words, 15, sizeof(RPC));
+	recon = vkc.make_pipeline_from_code(recon_spv, recon_words, 15, sizeof(RPC), 2);
 	emit = vkc.make_pipeline_from_code(emit_spv, emit_words, 8, sizeof(EPC));
 	prefix = vkc.make_pipeline_from_code(prefix_spv, prefix_words, 3, sizeof(PPC));
 	stitch = vkc.make_pipeline_from_code(stitch_spv, stitch_words, 4, sizeof(SPC));
@@ -54,7 +54,7 @@ void encoder::init_adopt(VkPhysicalDevice phys, VkDevice dev, VkQueue queue, uin
 void encoder::init_own(const char * recon_path, const char * emit_path, const char * prefix_path, const char * stitch_path)
 {
 	vkc.init();
-	recon = vkc.make_pipeline(recon_path, 15, sizeof(RPC));
+	recon = vkc.make_pipeline(recon_path, 15, sizeof(RPC), 2);
 	emit = vkc.make_pipeline(emit_path, 8, sizeof(EPC));
 	prefix = vkc.make_pipeline(prefix_path, 3, sizeof(PPC));
 	stitch = vkc.make_pipeline(stitch_path, 4, sizeof(SPC));
@@ -66,8 +66,9 @@ void encoder::ensure_buffers(const h264_config & cfg, int ew, int eh)
 	const int cw = cfg.coded_width(), ch = cfg.coded_height();
 	if (alloc_cw == cw && alloc_ch == ch && alloc_ew == ew)
 		return;
-	for (auto * b : {&sY, &sChroma, &rY, &rCb, &rCr, &lDC, &lAC, &cDC, &cAC, &nnzL, &nnzC, &scratch, &bitLen, &offset, &total, &outbits, &mbOrder, &claim, &doneBuf, &haloBuf})
+	for (auto * b : {&rY, &rCb, &rCr, &lDC, &lAC, &cDC, &cAC, &nnzL, &nnzC, &scratch, &bitLen, &offset, &total, &outbits, &mbOrder, &claim, &doneBuf, &haloBuf})
 		vkc.destroy_buffer(*b);
+	vkc.destroy_yuv_image(srcImg);
 
 	const int cw2 = cw / 2, ch2 = ch / 2;
 	const int nmb = (cw / 16) * (ch / 16);
@@ -76,8 +77,7 @@ void encoder::ensure_buffers(const h264_config & cfg, int ew, int eh)
 	// device-local memory; only the source upload (WC) and outbits/total (CPU-read
 	// each frame, host-cached) stay on host memory.
 	const int G = vk_compute::MEM_GPU;
-	sY = vkc.make_buffer(round4((size_t)ew * eh));                        // upload (WC)
-	sChroma = vkc.make_buffer(round4((size_t)ew * eh / 2));               // upload (WC)
+	srcImg = vkc.make_yuv_image(ew, eh);                                  // source YUV image
 	rY = vkc.make_buffer(round4((size_t)cw * ch), G);      // packed u8
 	rCb = vkc.make_buffer(round4((size_t)cw2 * ch2), G);   // packed u8
 	rCr = vkc.make_buffer(round4((size_t)cw2 * ch2), G);   // packed u8
@@ -110,9 +110,10 @@ void encoder::ensure_buffers(const h264_config & cfg, int ew, int eh)
 	alloc_cw = cw; alloc_ch = ch; alloc_ew = ew;
 }
 
-std::vector<uint8_t> encoder::encode_frame(const h264_config & cfg, int ew, int eh,
-                                           const uint8_t * lumaU8, const uint8_t * chromaU8,
-                                           uint8_t * recY, uint8_t * recCb, uint8_t * recCr)
+std::vector<uint8_t> encoder::encode_image(const h264_config & cfg, int ew, int eh,
+                                           VkImageView srcY_view, VkImageView srcC_view,
+                                           VkSemaphore wait_sem, uint64_t wait_val,
+                                           uint8_t * recY, uint8_t * recCb, uint8_t * recCr, double upload_us)
 {
 	using clk = std::chrono::steady_clock;
 	auto us = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::micro>(b - a).count(); };
@@ -120,11 +121,6 @@ std::vector<uint8_t> encoder::encode_frame(const h264_config & cfg, int ew, int 
 	const int cw = cfg.coded_width(), ch = cfg.coded_height(), cw2 = cw / 2, ch2 = ch / 2;
 	const int mbw = cfg.mb_width(), mbh = cfg.mb_height(), nmb = mbw * mbh;
 	const int qpc = wivrn::avc::xform::chroma_qp(cfg.qp);
-	ensure_buffers(cfg, ew, eh);
-
-	auto t0 = clk::now();
-	std::memcpy(sY.ptr, lumaU8, (size_t)ew * eh);
-	std::memcpy(sChroma.ptr, chromaU8, (size_t)ew * eh / 2);
 
 	auto t1 = clk::now();
 	// Scoreboard reconstruction: one dispatch of N persistent workgroups. Each
@@ -134,7 +130,8 @@ std::vector<uint8_t> encoder::encode_frame(const h264_config & cfg, int ew, int 
 	// dispatch instead of ~99 pipeline barriers. N stays <= the co-resident
 	// workgroup count for forward progress; 64 is trivially resident on the
 	// 16-CU APU and exceeds the max anti-diagonal width (no lost parallelism).
-	std::vector<vk_compute::buffer *> rbind = {&sY, &sChroma, &rY, &rCb, &rCr, &lDC, &lAC, &cDC, &cAC, &nnzL, &nnzC, &mbOrder, &claim, &doneBuf, &haloBuf};
+	// Bindings 0,1 are the source image views (passed to record_dispatch_img).
+	std::vector<vk_compute::buffer *> rbind = {&rY, &rCb, &rCr, &lDC, &lAC, &cDC, &cAC, &nnzL, &nnzC, &mbOrder, &claim, &doneBuf, &haloBuf};
 	// Only reconstruct the full planes when the caller wants them (tests); the live
 	// path (nullptr recon) skips the unused interior-block reconstruction.
 	const uint32_t full_recon = (recY || recCb || recCr) ? 1u : 0u;
@@ -167,7 +164,7 @@ std::vector<uint8_t> encoder::encode_frame(const h264_config & cfg, int ew, int 
 	vkc.record_fill(b, claim, 4, 0);                 // claim counter = 0
 	vkc.record_fill(b, doneBuf, (size_t)nmb * 4, 0); // per-MB done flags = 0
 	vkc.record_timestamp(b); // ts1: fills done, before recon
-	vkc.record_dispatch(b, recon, rbind, recon_wg, 1, 1, &rpc, sizeof(rpc), /*leading_barrier=*/false);
+	vkc.record_dispatch_img(b, recon, {srcY_view, srcC_view}, rbind, recon_wg, 1, 1, &rpc, sizeof(rpc), /*leading_barrier=*/false);
 	vkc.record_timestamp(b); // ts2: recon done
 	// emit is now one workgroup (32 lanes) per MB: intra-MB parallel over segments.
 	vkc.record_dispatch(b, emit, {&lDC, &lAC, &cDC, &cAC, &nnzL, &nnzC, &scratch, &bitLen}, (uint32_t)nmb, 1, 1, &epc, sizeof(epc), true);
@@ -176,7 +173,7 @@ std::vector<uint8_t> encoder::encode_frame(const h264_config & cfg, int ew, int 
 	vkc.record_timestamp(b); // ts4: prefix done
 	vkc.record_dispatch(b, stitch, {&scratch, &bitLen, &offset, &outbits}, groups, 1, 1, &spc, sizeof(spc), true);
 	vkc.record_timestamp(b); // ts5: stitch done
-	vkc.submit_and_wait(b);
+	vkc.submit_and_wait(b, wait_sem, wait_val);
 	const double gpu_fills_us = vkc.ts_us(b, 0, 1);
 	const double gpu_recon_us = vkc.ts_us(b, 1, 2);
 	const double gpu_cavlc_us = vkc.ts_us(b, 2, 5);
@@ -221,9 +218,33 @@ std::vector<uint8_t> encoder::encode_frame(const h264_config & cfg, int ew, int 
 	// is the whole batch wall-clock and cavlc_us folds into it (0).
 	const double recon_report = gpu_prof ? gpu_recon_us : us(t1, t2);
 	const double cavlc_report = gpu_prof ? gpu_cavlc_us : 0.0;
-	last_timings = {us(t0, t1), recon_report, cavlc_report, us(t3, clk::now()),
+	last_timings = {upload_us, recon_report, cavlc_report, us(t3, clk::now()),
 	                gpu_emit_us, gpu_prefix_us, gpu_stitch_us, gpu_fills_us};
 	return frame;
+}
+
+// Offline / test path: CPU-upload the raw planes into the source image, then encode.
+std::vector<uint8_t> encoder::encode_frame(const h264_config & cfg, int ew, int eh,
+                                           const uint8_t * lumaU8, const uint8_t * chromaU8,
+                                           uint8_t * recY, uint8_t * recCb, uint8_t * recCr)
+{
+	using clk = std::chrono::steady_clock;
+	ensure_buffers(cfg, ew, eh);
+	auto t0 = clk::now();
+	vkc.upload_yuv(srcImg, lumaU8, chromaU8);
+	double up = std::chrono::duration<double, std::micro>(clk::now() - t0).count();
+	return encode_image(cfg, ew, eh, srcImg.view_y, srcImg.view_c, VK_NULL_HANDLE, 0, recY, recCb, recCr, up);
+}
+
+// Live path: sample the compositor's plane views directly (no copy); the submit
+// waits on the compositor's timeline semaphore.
+std::vector<uint8_t> encoder::encode_frame_image(const h264_config & cfg, int ew, int eh,
+                                                 VkImageView srcY_view, VkImageView srcC_view,
+                                                 VkSemaphore wait_sem, uint64_t wait_val,
+                                                 uint8_t * recY, uint8_t * recCb, uint8_t * recCr)
+{
+	ensure_buffers(cfg, ew, eh);
+	return encode_image(cfg, ew, eh, srcY_view, srcC_view, wait_sem, wait_val, recY, recCb, recCr, 0.0);
 }
 
 } // namespace wivrn::avc::gpu

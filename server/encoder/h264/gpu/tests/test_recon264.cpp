@@ -31,7 +31,7 @@ int main(int argc, char ** argv)
 	const char * spv = argc > 1 ? argv[1] : "/tmp/r264.spv";
 	vk_compute vk;
 	vk.init();
-	auto pipe = vk.make_pipeline(spv, 15, sizeof(PC));
+	auto pipe = vk.make_pipeline(spv, 15, sizeof(PC), 2);
 
 	int fails = 0;
 	struct tc { int w, h, qp; };
@@ -59,8 +59,6 @@ int main(int argc, char ** argv)
 		// GPU buffers
 		auto round4 = [](size_t n) { return (n + 3) & ~size_t(3); };
 		const int nmb = mbw * mbh;
-		auto bSY = vk.make_buffer(round4((size_t)ew * eh));
-		auto bSC = vk.make_buffer(round4((size_t)ew * eh / 2));
 		auto bRY = vk.make_buffer(round4((size_t)cw * ch), true);      // packed u8
 		auto bRCb = vk.make_buffer(round4((size_t)cw2 * ch2), true);   // packed u8
 		auto bRCr = vk.make_buffer(round4((size_t)cw2 * ch2), true);   // packed u8
@@ -71,15 +69,14 @@ int main(int argc, char ** argv)
 		auto bNL = vk.make_buffer((size_t)(cw / 4) * (ch / 4) * 4, true);
 		auto bNC = vk.make_buffer((size_t)2 * (cw / 8) * (ch / 8) * 4, true);
 
-		// pack sources
-		memcpy(bSY.ptr, img.Y.data(), (size_t)ew * eh);
-		{
-			uint8_t * c = (uint8_t *)bSC.ptr;
-			for (int y = 0; y < ch2; ++y) for (int x = 0; x < cw2; ++x) {
-				c[((size_t)y * cw2 + x) * 2 + 0] = img.Cb[(size_t)y * cw2 + x];
-				c[((size_t)y * cw2 + x) * 2 + 1] = img.Cr[(size_t)y * cw2 + x];
-			}
+		// source YUV image (direct-sampling path): luma + interleaved CbCr
+		std::vector<uint8_t> chroma((size_t)cw2 * ch2 * 2);
+		for (int y = 0; y < ch2; ++y) for (int x = 0; x < cw2; ++x) {
+			chroma[((size_t)y * cw2 + x) * 2 + 0] = img.Cb[(size_t)y * cw2 + x];
+			chroma[((size_t)y * cw2 + x) * 2 + 1] = img.Cr[(size_t)y * cw2 + x];
 		}
+		auto yimg = vk.make_yuv_image(ew, eh);
+		vk.upload_yuv(yimg, img.Y.data(), chroma.data());
 
 		// scoreboard: anti-diagonal MB order + claim counter + done flags
 		auto bOrd = vk.make_buffer((size_t)nmb * 4);
@@ -95,10 +92,10 @@ int main(int argc, char ** argv)
 			memset(bDone.ptr, 0, (size_t)nmb * 4);
 		}
 		auto bHalo = vk.make_buffer((size_t)nmb * 16 * 4, true);
-		std::vector<vk_compute::buffer *> binds = {&bSY, &bSC, &bRY, &bRCb, &bRCr, &bLDC, &bLAC, &bCDC, &bCAC, &bNL, &bNC, &bOrd, &bClaim, &bDone, &bHalo};
+		std::vector<vk_compute::buffer *> binds = {&bRY, &bRCb, &bRCr, &bLDC, &bLAC, &bCDC, &bCAC, &bNL, &bNC, &bOrd, &bClaim, &bDone, &bHalo};
 		const int qpc = wivrn::avc::xform::chroma_qp(t.qp);
 		PC pc{(uint32_t)mbw, (uint32_t)mbh, t.qp, qpc, (uint32_t)cw, (uint32_t)ch, (uint32_t)ew, (uint32_t)eh, (uint32_t)nmb, 1u};
-		vk.run(pipe, binds, std::min(nmb, 64), 1, 1, &pc, sizeof(pc));
+		vk.run_img(pipe, {yimg.view_y, yimg.view_c}, binds, std::min(nmb, 64), 1, 1, &pc, sizeof(pc));
 
 		int mism = 0;
 		auto * gY = (uint8_t *)bRY.ptr; auto * gCb = (uint8_t *)bRCb.ptr; auto * gCr = (uint8_t *)bRCr.ptr; // packed u8
@@ -109,6 +106,7 @@ int main(int argc, char ** argv)
 		printf("%dx%d qp%d (%d MBs): recon mismatch=%d  %s\n", t.w, t.h, t.qp, nmb, mism, mism ? "FAIL" : "PASS");
 
 		for (auto * b : binds) vk.destroy_buffer(*b);
+		vk.destroy_yuv_image(yimg);
 	}
 	printf("\n%s (%d failures)\n", fails == 0 ? "GPU RECON BIT-EXACT vs CPU" : "FAILURES", fails);
 	return fails ? 1 : 0;
